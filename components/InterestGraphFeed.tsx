@@ -20,6 +20,8 @@ interface FeedNode {
   tags: string[];
 }
 
+const VELOCITY_THRESHOLD = 180;
+
 const FEED_NODES: FeedNode[] = [
   {
     id: "1",
@@ -314,8 +316,6 @@ export default function InterestGraphFeed() {
   const { scrollY } = useScroll();
   const scrollVelocity = useVelocity(scrollY);
   const [readingMode, setReadingMode] = useState(true);
-
-  const VELOCITY_THRESHOLD = 180;
 
   useMotionValueEvent(scrollVelocity, "change", useCallback((v: number) => {
     setReadingMode(Math.abs(v) < VELOCITY_THRESHOLD);
