@@ -46,7 +46,7 @@ export default function Home() {
           Quant<span className="text-transparent bg-clip-text bg-gradient-to-r from-violet-400 to-pink-400">sink</span>
         </h1>
         <p className="text-sm text-white/40 mt-1 tracking-widest uppercase">
-          Quantchill · MatchMaker · VIP
+          QuantChill · MatchMaker · VIP
         </p>
       </motion.header>
 
