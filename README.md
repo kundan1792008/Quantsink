@@ -7,7 +7,7 @@ Unified Quantsink repository containing:
 
 ## Features
 
-- Biometric Quantmail JWT authentication
+- Biometric Quantmail JWT authentication, where Quantmail is the shared identity provider for the Quant ecosystem and every API token must include a `biometricVerified: true` claim
 - Digital Twin networking and zero-spam DM backend
 - Graph-based connections and endorsements API
 - Next.js landing/feed frontend
