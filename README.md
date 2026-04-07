@@ -18,7 +18,7 @@ Unified Quantsink repository containing:
 ### Prerequisites
 
 - Node.js 20+
-- PostgreSQL 15+
+- PostgreSQL 15+ (CI runs on PostgreSQL 16)
 
 ### Setup
 
