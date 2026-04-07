@@ -1,0 +1,194 @@
+// Prisma schema for Quantsink's graph-based connection engine
+// Handles professional relationships, skills, endorsements, and follower graphs
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// User (identity comes from Quantmail Biometric SSO — no local passwords)
+// ---------------------------------------------------------------------------
+model User {
+  id              String   @id @default(uuid())
+  quantmailId     String   @unique          // External Quantmail user ID
+  email           String   @unique
+  displayName     String
+  headline        String?                   // "Senior Engineer @ ..."
+  bio             String?
+  avatarUrl       String?
+  isVerified      Boolean  @default(false)
+  digitalTwinEnabled Boolean @default(false) // Opt-in for AI Digital Twin
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  shortPosts      ShortPost[]
+  deepPosts       DeepPost[]
+  skills          UserSkill[]
+  endorsementsGiven  Endorsement[] @relation("EndorserRelation")
+  endorsementsReceived Endorsement[] @relation("EndorsedRelation")
+  connectionsFrom Connection[] @relation("ConnectionFrom")
+  connectionsTo   Connection[] @relation("ConnectionTo")
+  followersOf     Follow[]     @relation("FollowTarget")
+  following       Follow[]     @relation("FollowSource")
+  dmsSent         DirectMessage[] @relation("DMSender")
+  dmsReceived     DirectMessage[] @relation("DMReceiver")
+
+  @@index([quantmailId])
+  @@index([email])
+}
+
+// ---------------------------------------------------------------------------
+// Professional Graph — Connections (bidirectional, like LinkedIn)
+// ---------------------------------------------------------------------------
+model Connection {
+  id          String           @id @default(uuid())
+  fromUser    User             @relation("ConnectionFrom", fields: [fromUserId], references: [id])
+  fromUserId  String
+  toUser      User             @relation("ConnectionTo", fields: [toUserId], references: [id])
+  toUserId    String
+  status      ConnectionStatus @default(PENDING)
+  message     String?          // Optional connect message
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([fromUserId, toUserId])
+  @@index([toUserId, status])
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  BLOCKED
+}
+
+// ---------------------------------------------------------------------------
+// Follow graph (unidirectional, like Twitter/Threads)
+// ---------------------------------------------------------------------------
+model Follow {
+  id          String   @id @default(uuid())
+  source      User     @relation("FollowSource", fields: [sourceId], references: [id])
+  sourceId    String
+  target      User     @relation("FollowTarget", fields: [targetId], references: [id])
+  targetId    String
+  createdAt   DateTime @default(now())
+
+  @@unique([sourceId, targetId])
+  @@index([targetId])
+}
+
+// ---------------------------------------------------------------------------
+// Skills & Endorsements
+// ---------------------------------------------------------------------------
+model Skill {
+  id        String      @id @default(uuid())
+  name      String      @unique
+  category  String?
+  users     UserSkill[]
+}
+
+model UserSkill {
+  id          String        @id @default(uuid())
+  user        User          @relation(fields: [userId], references: [id])
+  userId      String
+  skill       Skill         @relation(fields: [skillId], references: [id])
+  skillId     String
+  endorsements Endorsement[]
+  createdAt   DateTime      @default(now())
+
+  @@unique([userId, skillId])
+  @@index([userId])
+}
+
+model Endorsement {
+  id          String    @id @default(uuid())
+  endorser    User      @relation("EndorserRelation", fields: [endorserId], references: [id])
+  endorserId  String
+  endorsed    User      @relation("EndorsedRelation", fields: [endorsedId], references: [id])
+  endorsedId  String
+  userSkill   UserSkill @relation(fields: [userSkillId], references: [id])
+  userSkillId String
+  createdAt   DateTime  @default(now())
+
+  @@unique([endorserId, userSkillId])
+  @@index([endorsedId])
+}
+
+// ---------------------------------------------------------------------------
+// Dual-Feed Posts
+// ---------------------------------------------------------------------------
+
+// Short posts — Threads/Twitter style (fast microblogging)
+model ShortPost {
+  id        String   @id @default(uuid())
+  author    User     @relation(fields: [authorId], references: [id])
+  authorId  String
+  content   String   @db.VarChar(500)     // Hard 500-char limit
+  mediaUrls String[]
+  hashtags  String[]
+  likes     Int      @default(0)
+  reposts   Int      @default(0)
+  isDeleted Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([authorId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+}
+
+// Deep posts — LinkedIn-style long-form articles / portfolio pieces
+model DeepPost {
+  id            String   @id @default(uuid())
+  author        User     @relation(fields: [authorId], references: [id])
+  authorId      String
+  title         String
+  summary       String?  @db.VarChar(300)
+  content       String   @db.Text         // Rich-text / Markdown body
+  coverImageUrl String?
+  tags          String[]
+  readTimeMin   Int?                       // Estimated read time
+  likes         Int      @default(0)
+  views         Int      @default(0)
+  isPublished   Boolean  @default(false)
+  isDeleted     Boolean  @default(false)
+  publishedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([authorId, createdAt(sort: Desc)])
+  @@index([isPublished, publishedAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Direct Messages (Zero-Spam — tied to Quantmail shadow inbox)
+// ---------------------------------------------------------------------------
+model DirectMessage {
+  id          String    @id @default(uuid())
+  sender      User      @relation("DMSender",   fields: [senderId],   references: [id])
+  senderId    String
+  receiver    User      @relation("DMReceiver", fields: [receiverId], references: [id])
+  receiverId  String
+  content     String    @db.Text
+  spamScore   Float     @default(0)         // 0-1 score from Quantmail filter
+  spamAction  SpamAction @default(DELIVERED)
+  isRead      Boolean   @default(false)
+  handledByTwin Boolean @default(false)     // Was replied to by Digital Twin
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([receiverId, createdAt(sort: Desc)])
+  @@index([senderId])
+}
+
+enum SpamAction {
+  DELIVERED
+  SHADOW_INBOX   // Moved to shadow inbox, visible only if user checks
+  NEGOTIATED     // AI Twin replied to negotiate
+  DROPPED        // Automatically discarded
+}
