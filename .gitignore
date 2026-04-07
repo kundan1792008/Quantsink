@@ -8,6 +8,7 @@ out/
 # Production
 build/
 dist/
+coverage/
 
 # Debug
 npm-debug.log*
@@ -16,8 +17,8 @@ yarn-error.log*
 *.log
 
 # Local env files
-.env*.local
 .env
+.env*.local
 
 # TypeScript
 *.tsbuildinfo
