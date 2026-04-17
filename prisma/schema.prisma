@@ -38,6 +38,7 @@ model User {
   following       Follow[]     @relation("FollowSource")
   dmsSent         DirectMessage[] @relation("DMSender")
   dmsReceived     DirectMessage[] @relation("DMReceiver")
+  broadcasts      Broadcast[]
 
   @@index([quantmailId])
   @@index([email])
@@ -191,4 +192,37 @@ enum SpamAction {
   SHADOW_INBOX   // Moved to shadow inbox, visible only if user checks
   NEGOTIATED     // AI Twin replied to negotiate
   DROPPED        // Automatically discarded
+}
+
+// ---------------------------------------------------------------------------
+// Broadcasts — Quantsink Pro zero-reply broadcast posts
+// ---------------------------------------------------------------------------
+model Broadcast {
+  id                String    @id @default(uuid())
+  author            User      @relation(fields: [authorId], references: [id])
+  authorId          String
+  content           String    @db.Text
+  biometricHash     String
+  biometricVerified Boolean   @default(true)
+  viewCount         Int       @default(0)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  @@index([authorId])
+  @@index([createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Security Audit Log — tracks zero-reply protocol violations
+// ---------------------------------------------------------------------------
+model SecurityAuditLog {
+  id          String   @id @default(uuid())
+  attemptType String
+  ipAddress   String
+  userAgent   String
+  timestamp   DateTime @default(now())
+  blocked     Boolean  @default(true)
+
+  @@index([timestamp(sort: Desc)])
 }
