@@ -3,7 +3,7 @@ import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { requireAuth } from '../middleware/auth';
 import { quantmailLiveness } from '../services/QuantmailLivenessService';
-import { broadcastNewPost } from '../lib/wsServer';
+import { pushBroadcast } from '../services/BroadcastWebSocket';
 
 const router = Router();
 
@@ -113,7 +113,14 @@ router.post('/short', requireAuth, zeroReplyGuard, async (req: Request, res: Res
     });
 
     // Real-time push: broadcast new post to all connected WebSocket clients.
-    broadcastNewPost({ type: 'short', ...post } as unknown as Record<string, unknown>);
+    pushBroadcast({
+      id:                  post.id,
+      content:             post.content,
+      authorId:            user.id,
+      authorDisplayName:   user.displayName,
+      biometricVerified:   true,
+      createdAt:           post.createdAt.toISOString(),
+    });
 
     res.status(201).json({ post });
   } catch (err) {
@@ -169,7 +176,14 @@ router.post('/deep', requireAuth, zeroReplyGuard, async (req: Request, res: Resp
     });
 
     // Real-time push: broadcast new post to all connected WebSocket clients.
-    broadcastNewPost({ type: 'deep', ...post } as unknown as Record<string, unknown>);
+    pushBroadcast({
+      id:                  post.id,
+      content:             post.title,
+      authorId:            user.id,
+      authorDisplayName:   user.displayName,
+      biometricVerified:   true,
+      createdAt:           post.createdAt.toISOString(),
+    });
 
     res.status(201).json({ post });
   } catch (err) {

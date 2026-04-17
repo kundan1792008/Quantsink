@@ -2,23 +2,29 @@
 
 import { useEffect, useRef, useCallback } from "react";
 
+export interface WsNewBroadcastEvent {
+  type: "NEW_BROADCAST";
+  data: Record<string, unknown>;
+}
+
 export interface WsNewPostEvent {
   type: "NEW_POST";
   post: Record<string, unknown>;
 }
 
-type WsMessage = WsNewPostEvent;
+type WsMessage = WsNewBroadcastEvent | WsNewPostEvent;
 
 /**
  * useWebSocketFeed
  *
  * Opens a persistent WebSocket connection to the Quantsink broadcast server
- * and calls `onNewPost` whenever the server pushes a NEW_POST event.
+ * and calls `onNewPost` whenever the server pushes a NEW_BROADCAST or
+ * NEW_POST event.
  *
  * The hook automatically reconnects with exponential back-off when the
  * connection drops, ensuring the real-time feed remains live.
  *
- * @param onNewPost  Callback invoked with every new-post broadcast.
+ * @param onNewPost  Callback invoked with every new broadcast.
  * @param url        WebSocket URL (defaults to NEXT_PUBLIC_WS_URL or auto-
  *                   detected relative URL so the app works in any environment).
  */
@@ -53,7 +59,11 @@ export function useWebSocketFeed(
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data as string) as WsMessage;
-        if (data.type === "NEW_POST") {
+        // Support both the advanced BroadcastWebSocket (NEW_BROADCAST) and the
+        // legacy wsServer (NEW_POST) event shapes.
+        if (data.type === "NEW_BROADCAST") {
+          onNewPostRef.current(data.data);
+        } else if (data.type === "NEW_POST") {
           onNewPostRef.current(data.post);
         }
       } catch {
