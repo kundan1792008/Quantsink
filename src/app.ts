@@ -6,6 +6,7 @@ import postsRouter from './routes/posts';
 import connectionsRouter from './routes/connections';
 import dmsRouter from './routes/dms';
 import broadcastsRouter from './routes/broadcasts';
+import influenceRouter from './routes/influence';
 import { errorHandler } from './middleware/errorHandler';
 import { zeroReplyGuard } from './middleware/zeroReplyGuard';
 import { getConnectedClientCount } from './services/BroadcastWebSocket';
@@ -53,6 +54,7 @@ app.use('/api/v1/posts',       apiLimiter,   postsRouter);
 app.use('/api/v1/connections', writeLimiter, connectionsRouter);
 app.use('/api/v1/dms',         writeLimiter, dmsRouter);
 app.use('/api/v1/broadcasts',  writeLimiter, broadcastsRouter);
+app.use('/api/v1/influence',   apiLimiter,   influenceRouter);
 
 // ---------------------------------------------------------------------------
 // WebSocket stats endpoint
