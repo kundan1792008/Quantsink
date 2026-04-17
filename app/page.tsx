@@ -1,5 +1,6 @@
 import VIPTray from "@/components/VIPTray";
 import InterestGraphFeed from "@/components/InterestGraphFeed";
+import BroadcastComposer from "@/components/BroadcastComposer";
 
 export default function Home() {
   return (
@@ -8,6 +9,7 @@ export default function Home() {
       <div className="pt-[72px]">
         <InterestGraphFeed />
       </div>
+      <BroadcastComposer />
     </main>
   );
 }
