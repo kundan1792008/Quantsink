@@ -222,18 +222,19 @@ export class PersonalizedFeedAI {
     this.now = options.now ?? (() => new Date());
 
     // Normalise blend weights to sum 1.
-    const c = options.contentWeight ?? 0.45;
-    const co = options.collaborativeWeight ?? 0.3;
-    const r = options.recencyWeight ?? 0.15;
-    const f = options.followWeight ?? 0.1;
-    const total = c + co + r + f;
+    const rawContentWeight = options.contentWeight ?? 0.45;
+    const rawCollaborativeWeight = options.collaborativeWeight ?? 0.3;
+    const rawRecencyWeight = options.recencyWeight ?? 0.15;
+    const rawFollowWeight = options.followWeight ?? 0.1;
+    const total =
+      rawContentWeight + rawCollaborativeWeight + rawRecencyWeight + rawFollowWeight;
     if (total <= 0) {
       throw new Error('Blend weights must sum to a positive number');
     }
-    this.contentWeight = c / total;
-    this.collaborativeWeight = co / total;
-    this.recencyWeight = r / total;
-    this.followWeight = f / total;
+    this.contentWeight = rawContentWeight / total;
+    this.collaborativeWeight = rawCollaborativeWeight / total;
+    this.recencyWeight = rawRecencyWeight / total;
+    this.followWeight = rawFollowWeight / total;
 
     this.recencyHalfLifeHours = options.recencyHalfLifeHours ?? 8;
     this.neighbourPoolSize = options.neighbourPoolSize ?? 40;

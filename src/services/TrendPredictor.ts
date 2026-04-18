@@ -147,10 +147,10 @@ export function tokenise(text: string): string[] {
 export function bigrams(tokens: readonly string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < tokens.length - 1; i += 1) {
-    const a = tokens[i];
-    const b = tokens[i + 1];
-    if (a.length > 2 && b.length > 2) {
-      out.push(`${a} ${b}`);
+    const firstToken = tokens[i];
+    const secondToken = tokens[i + 1];
+    if (firstToken.length > 2 && secondToken.length > 2) {
+      out.push(`${firstToken} ${secondToken}`);
     }
   }
   return out;
@@ -329,8 +329,8 @@ export class TrendPredictor {
       const uniqueUnigrams = Array.from(new Set(tokens));
       for (let i = 0; i < uniqueUnigrams.length; i += 1) {
         for (let j = i + 1; j < uniqueUnigrams.length; j += 1) {
-          const [x, y] = [uniqueUnigrams[i], uniqueUnigrams[j]].sort();
-          const key = `${x}||${y}`;
+          const [firstTerm, secondTerm] = [uniqueUnigrams[i], uniqueUnigrams[j]].sort();
+          const key = `${firstTerm}||${secondTerm}`;
           const existing = pairs.get(key);
           if (existing) {
             existing.count += 1;
