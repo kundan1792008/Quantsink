@@ -26,7 +26,9 @@
     "components/**/*.tsx",
     "lib/**/*.ts",
     "lib/**/*.tsx",
+    "src/components/**/*.ts",
+    "src/components/**/*.tsx",
     ".next/types/**/*.ts"
   ],
-  "exclude": ["node_modules", "dist", "coverage", "src"]
+  "exclude": ["node_modules", "dist", "coverage", "src/__tests__", "src/index.ts", "src/app.ts", "src/middleware", "src/routes", "src/workers"]
 }
