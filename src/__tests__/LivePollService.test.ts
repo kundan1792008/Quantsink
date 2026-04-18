@@ -208,6 +208,7 @@ describe('LivePollService snapshots and reveals', () => {
     svc.vote({ pollId: poll.id, userId: 'u1', optionId: 'opt_1' });
     svc.vote({ pollId: poll.id, userId: 'u2', optionId: 'opt_1' });
     svc.vote({ pollId: poll.id, userId: 'u3', optionId: 'opt_2' });
+    svc.tick();
     expect(tallies.length).toBeGreaterThan(0);
     const last = tallies[tallies.length - 1];
     expect(last.totalVotes).toBe(3);
