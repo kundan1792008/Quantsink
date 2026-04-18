@@ -32,13 +32,9 @@ import { requireAuth } from '../middleware/auth';
  * application still boots in environments without a database.
  */
 
-const CHALLENGE_KINDS: readonly InfluenceChallengeKind[] = [
-  'POST_STREAK',
-  'BIOMETRIC_WEEK',
-  'CROSS_APP_EXPLORER',
-  'QUALITY_AUTHOR',
-  'COMMUNITY_UPLIFT',
-];
+const CHALLENGE_KINDS: readonly InfluenceChallengeKind[] = Object.keys(
+  DEFAULT_CHALLENGE_TEMPLATES,
+) as InfluenceChallengeKind[];
 
 const ChallengeSchema = z.object({
   kind: z.enum(CHALLENGE_KINDS as unknown as [string, ...string[]]),

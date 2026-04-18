@@ -22,6 +22,7 @@ import {
   weightedTotal,
 } from './InfluenceScoreDomain';
 
+import { unrefTimer } from '../lib/timers';
 import QualityRatingAI from './QualityRatingAI';
 
 /**
@@ -585,9 +586,7 @@ export class InfluenceScoreService {
         );
       });
     }, this.recalcIntervalMs);
-    if (typeof (this.recalcTimer as { unref?: () => void }).unref === 'function') {
-      (this.recalcTimer as unknown as { unref: () => void }).unref();
-    }
+    unrefTimer(this.recalcTimer);
     influenceLog('info', { intervalMs: this.recalcIntervalMs }, 'InfluenceScoreService started');
   }
 

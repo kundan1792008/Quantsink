@@ -7,6 +7,7 @@ import {
   influenceLog,
   tierForTotal,
 } from '../services/InfluenceScoreDomain';
+import { unrefTimer } from '../lib/timers';
 
 /**
  * ScoreDecayWorker
@@ -173,9 +174,7 @@ export class ScoreDecayWorker {
         );
       });
     }, this.tickIntervalMs);
-    if (typeof (this.timer as { unref?: () => void }).unref === 'function') {
-      (this.timer as unknown as { unref: () => void }).unref();
-    }
+    unrefTimer(this.timer);
     influenceLog('info', { intervalMs: this.tickIntervalMs }, 'ScoreDecayWorker started');
   }
 
