@@ -1,317 +1,604 @@
+import {
+  BroadcastQualityRatingRecord,
+  InMemoryInfluenceStore,
+  InfluenceStore,
+  clamp,
+  clamp100,
+  influenceLog,
+} from './InfluenceScoreDomain';
+
 /**
- * QualityRatingAI — Broadcast Quality Rater
+ * QualityRatingAI
+ * ---------------
+ * On-device Gemma-powered broadcast quality rater required by issue
+ * #16. Responsibilities:
  *
- * Simulates an on-device Gemma-style language model that rates broadcast
- * quality on five axes (originality, clarity, relevance, media quality,
- * spelling/grammar) and returns a composite 0-100 score with a plain-English
- * explanation.
+ *  - Decompose each broadcast into five scoreable factors (originality,
+ *    clarity, relevance, media quality, spelling/grammar).
+ *  - Build a structured prompt and dispatch it to an injectable
+ *    `GemmaModelClient` so the heavy model stays swappable (ONNX,
+ *    llama.cpp, Google's on-device Gemma Nano, etc.).
+ *  - Parse the structured JSON reply, validate it, and persist the
+ *    rating to the injected `InfluenceStore` so the score service can
+ *    later aggregate it.
+ *  - Fall back to a deterministic heuristic rater when the model is
+ *    offline so the wider pipeline never hard-fails.
  *
- * In production this would delegate to the local Gemma inference endpoint;
- * in this implementation the heuristics are deterministic enough for unit
- * testing while being sophisticated enough to differentiate content quality.
+ * This file intentionally has no direct network dependency — all I/O
+ * goes through the `GemmaModelClient` interface, which keeps the
+ * service 100% unit-testable.
  */
 
-import logger from '../lib/logger';
-
 // ---------------------------------------------------------------------------
-// Public types
+// Types
 // ---------------------------------------------------------------------------
 
-export interface QualityDimension {
-  /** Axis name. */
-  readonly name: string;
-  /** 0-100 score for this dimension. */
-  readonly score: number;
-  /** One-sentence explanation. */
-  readonly rationale: string;
+export interface BroadcastForRating {
+  readonly broadcastId: string;
+  readonly authorId: string;
+  readonly content: string;
+  readonly mediaUrls?: readonly string[];
+  /** Hashtags / topics declared by the author. */
+  readonly topics?: readonly string[];
+  /** Language hint ("en", "es", ...). Defaults to "en". */
+  readonly language?: string;
 }
 
-export interface QualityRating {
-  /** Composite 0-100 score. */
-  readonly score: number;
-  /** Human-readable overall explanation. */
+export interface QualityFactors {
+  readonly originality: number;   // 0–100
+  readonly clarity: number;       // 0–100
+  readonly relevance: number;     // 0–100
+  readonly mediaQuality: number;  // 0–100
+  readonly grammar: number;       // 0–100
+}
+
+export interface QualityRating extends QualityFactors {
+  readonly score: number;         // 0–100 aggregate
   readonly explanation: string;
-  /** Per-dimension breakdown. */
-  readonly dimensions: readonly QualityDimension[];
-  /** ISO timestamp of when the rating was produced. */
-  readonly ratedAt: string;
-  /** Token-level analysis hint (length, avg word length). */
-  readonly textStats: TextStats;
+  readonly modelName: string;
+  readonly ratedAt: Date;
+  readonly broadcastId: string;
+  readonly authorId: string;
 }
 
-export interface TextStats {
-  readonly charCount: number;
-  readonly wordCount: number;
-  readonly sentenceCount: number;
-  readonly avgWordLength: number;
-  readonly avgSentenceLength: number;
-  readonly uniqueWordRatio: number;
+export interface GemmaPromptMessage {
+  readonly role: 'system' | 'user';
+  readonly content: string;
 }
 
-export interface QualityRatingOptions {
-  /** Injected clock for tests. */
+export interface GemmaCompletionRequest {
+  readonly messages: readonly GemmaPromptMessage[];
+  readonly temperature: number;
+  readonly maxTokens: number;
+  readonly seed?: number;
+}
+
+export interface GemmaCompletionResponse {
+  readonly modelName: string;
+  readonly text: string;
+  readonly tokensUsed?: number;
+}
+
+export interface GemmaModelClient {
+  readonly name: string;
+  readonly isReady: () => boolean;
+  readonly complete: (
+    req: GemmaCompletionRequest,
+  ) => Promise<GemmaCompletionResponse>;
+}
+
+export interface QualityRatingAIOptions {
+  readonly model?: GemmaModelClient;
+  readonly store?: InfluenceStore;
   readonly now?: () => Date;
-  /** Media attachment count — increases media quality dimension. */
-  readonly mediaCount?: number;
-  /** Whether the user is biometrically verified — slight uplift. */
-  readonly biometricVerified?: boolean;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly fallbackModelName?: string;
+  readonly enablePersistence?: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Factor math (pure, exported for tests)
 // ---------------------------------------------------------------------------
 
-/** Very fast approximate sentence splitter. */
-function splitSentences(text: string): string[] {
-  return text
-    .split(/[.!?]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+export const FACTOR_WEIGHTS = Object.freeze({
+  originality: 0.3,
+  clarity: 0.2,
+  relevance: 0.2,
+  mediaQuality: 0.15,
+  grammar: 0.15,
+});
+
+export function aggregateFactors(factors: QualityFactors): number {
+  const total =
+    factors.originality * FACTOR_WEIGHTS.originality +
+    factors.clarity * FACTOR_WEIGHTS.clarity +
+    factors.relevance * FACTOR_WEIGHTS.relevance +
+    factors.mediaQuality * FACTOR_WEIGHTS.mediaQuality +
+    factors.grammar * FACTOR_WEIGHTS.grammar;
+  return clamp100(total);
 }
 
-/** Tokenise into lowercase words. */
-function tokenise(text: string): string[] {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s'-]/g, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 0);
-}
+// ---------------------------------------------------------------------------
+// Heuristic factor scorers (used by the fallback rater)
+// ---------------------------------------------------------------------------
 
-/**
- * Score 1 — Originality (0-100).
- * Proxy: penalise repetition (unique word ratio) and very short content.
- */
-function scoreOriginality(text: string, words: string[]): QualityDimension {
-  if (words.length === 0) {
-    return { name: 'Originality', score: 0, rationale: 'No content to evaluate.' };
-  }
-  const uniqueRatio = new Set(words).size / words.length;
-  const lengthBonus = Math.min(words.length / 50, 1); // full bonus at 50+ words
-  const raw = uniqueRatio * 0.7 + lengthBonus * 0.3;
-  const score = Math.round(clamp(raw * 100, 0, 100));
-  const rationale =
-    score >= 75
-      ? 'Strong vocabulary variety suggests original thinking.'
-      : score >= 50
-        ? 'Moderate originality; some word repetition detected.'
-        : 'High repetition or very short content limits originality signals.';
-  return { name: 'Originality', score, rationale };
-}
-
-/**
- * Score 2 — Clarity (0-100).
- * Proxy: average sentence length (15-20 words = optimal) + short word preference.
- */
-function scoreClarity(sentences: string[], words: string[]): QualityDimension {
-  if (sentences.length === 0 || words.length === 0) {
-    return { name: 'Clarity', score: 0, rationale: 'No content to evaluate.' };
-  }
-  const avgSentLen = words.length / sentences.length;
-  // Optimal sentence length ~15-20 words; penalise extremes.
-  const sentPenalty = Math.abs(avgSentLen - 17.5) / 17.5;
-  const avgWordLen = words.reduce((s, w) => s + w.length, 0) / words.length;
-  // Shorter average word length → more accessible.
-  const wordPenalty = Math.max(0, (avgWordLen - 5) / 5);
-  const raw = 1 - clamp((sentPenalty + wordPenalty) / 2, 0, 1);
-  const score = Math.round(clamp(raw * 100, 0, 100));
-  const rationale =
-    score >= 75
-      ? 'Clear sentence structure and accessible vocabulary.'
-      : score >= 50
-        ? 'Readability is acceptable but could be improved with shorter sentences.'
-        : 'Dense or run-on sentences reduce clarity.';
-  return { name: 'Clarity', score, rationale };
-}
-
-/**
- * Score 3 — Relevance (0-100).
- * Proxy: presence of meaningful signal words vs filler words.
- */
-const FILLER_WORDS = new Set([
-  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'shall',
-  'should', 'may', 'might', 'can', 'could', 'to', 'of', 'in', 'on', 'at',
-  'for', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during',
-  'this', 'that', 'these', 'those', 'it', 'its', 'and', 'or', 'but', 'so',
+const STOP_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'so', 'of', 'to', 'in', 'for', 'on', 'with',
+  'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+  'it', 'this', 'that', 'these', 'those', 'at', 'by', 'as', 'from', 'into',
+  'you', 'your', 'we', 'our', 'they', 'their', 'i', 'my',
 ]);
 
-function scoreRelevance(words: string[]): QualityDimension {
-  if (words.length === 0) {
-    return { name: 'Relevance', score: 0, rationale: 'No content to evaluate.' };
-  }
-  const signalWords = words.filter((w) => !FILLER_WORDS.has(w) && w.length > 3);
-  const signalRatio = signalWords.length / words.length;
-  const score = Math.round(clamp(signalRatio * 130, 0, 100)); // 130 factor so ~77% signal = 100
-  const rationale =
-    score >= 75
-      ? 'Content is dense with meaningful signal words.'
-      : score >= 50
-        ? 'Reasonable signal-to-noise ratio; consider trimming filler.'
-        : 'High proportion of filler words; strengthen the substantive content.';
-  return { name: 'Relevance', score, rationale };
+const CLICHE_PHRASES = [
+  'game changer',
+  'think outside the box',
+  'synergy',
+  'paradigm shift',
+  'move the needle',
+  'circle back',
+  'low hanging fruit',
+  'hustle',
+  'grind',
+  'just dropped',
+  'going viral',
+];
+
+const SHOUTING_RATIO_THRESHOLD = 0.35;
+
+function tokenise(content: string): string[] {
+  return content
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[^a-z0-9\s']/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
-/**
- * Score 4 — Media Quality (0-100).
- * Proxy: media attachment count. 0 = 50 baseline; each attachment +10 up to 100.
- */
-function scoreMediaQuality(mediaCount: number): QualityDimension {
-  const score = Math.round(clamp(50 + mediaCount * 10, 0, 100));
-  const rationale =
-    mediaCount === 0
-      ? 'No media attachments; adding visuals increases impact.'
-      : mediaCount >= 3
-        ? 'Rich media presence significantly boosts engagement potential.'
-        : `${mediaCount} media attachment${mediaCount > 1 ? 's' : ''} adds visual context.`;
-  return { name: 'Media Quality', score, rationale };
+export function scoreOriginality(content: string): number {
+  if (content.trim().length === 0) return 0;
+  const tokens = tokenise(content);
+  if (tokens.length === 0) return 0;
+
+  const unique = new Set(tokens);
+  const meaningful = tokens.filter((t) => !STOP_WORDS.has(t));
+  const ttr = unique.size / tokens.length;
+
+  const lower = content.toLowerCase();
+  const clicheHits = CLICHE_PHRASES.reduce((n, p) => (lower.includes(p) ? n + 1 : n), 0);
+
+  const volumeBoost = Math.min(25, meaningful.length / 2);
+  let score = ttr * 100 + volumeBoost - clicheHits * 12;
+  if (tokens.length < 6) score -= 20;
+  if (tokens.length > 80) score += 5;
+  return clamp100(score);
 }
 
-/**
- * Score 5 — Spelling & Grammar (0-100).
- * Proxy: heuristic checks — excessive caps, missing space after punctuation,
- * repeated consecutive words, and very high numeric ratio.
- */
-function scoreSpellingGrammar(text: string, words: string[]): QualityDimension {
-  if (words.length === 0) {
-    return { name: 'Spelling & Grammar', score: 0, rationale: 'No content to evaluate.' };
+export function scoreClarity(content: string): number {
+  const trimmed = content.trim();
+  if (trimmed.length === 0) return 0;
+  const sentences = trimmed.split(/[.!?]+/).map((s) => s.trim()).filter(Boolean);
+  if (sentences.length === 0) return 10;
+  const wordsPerSentence =
+    sentences.reduce((acc, s) => acc + tokenise(s).length, 0) / sentences.length;
+
+  // Target 8–22 words per sentence.
+  let score = 100;
+  if (wordsPerSentence < 4) score -= 30;
+  else if (wordsPerSentence < 8) score -= 10;
+  else if (wordsPerSentence > 28) score -= 35;
+  else if (wordsPerSentence > 22) score -= 15;
+
+  const exclamations = (trimmed.match(/!/g) ?? []).length;
+  if (exclamations > 2) score -= Math.min(25, (exclamations - 2) * 5);
+
+  const letters = trimmed.replace(/[^A-Za-z]/g, '');
+  if (letters.length > 20) {
+    const upper = letters.replace(/[^A-Z]/g, '').length;
+    const ratio = upper / letters.length;
+    if (ratio > SHOUTING_RATIO_THRESHOLD) score -= 30;
   }
-  let deductions = 0;
 
-  // Excessive ALL-CAPS words (>30% of words)
-  const capsRatio = words.filter((w) => w === w.toUpperCase() && /[A-Z]/.test(w)).length / words.length;
-  if (capsRatio > 0.3) deductions += 20;
-
-  // Missing space after sentence-ending punctuation
-  const missingSpaceMatches = (text.match(/[.!?][A-Za-z]/g) ?? []).length;
-  deductions += Math.min(missingSpaceMatches * 5, 20);
-
-  // Repeated consecutive words e.g. "the the"
-  const repeatedWords = words.filter((w, i) => i > 0 && w === words[i - 1]).length;
-  deductions += Math.min(repeatedWords * 10, 20);
-
-  // Very high numeric ratio (often spam/low quality)
-  const numericRatio = words.filter((w) => /^\d+$/.test(w)).length / words.length;
-  if (numericRatio > 0.4) deductions += 15;
-
-  const score = Math.round(clamp(100 - deductions, 0, 100));
-  const rationale =
-    score >= 80
-      ? 'No significant spelling or grammar issues detected.'
-      : score >= 55
-        ? 'Minor formatting or style issues present.'
-        : 'Several grammar or formatting issues reduce polish.';
-  return { name: 'Spelling & Grammar', score, rationale };
+  if (trimmed.length < 20) score -= 20;
+  return clamp100(score);
 }
 
-/** Dimension weights used in the composite score. */
-const DIMENSION_WEIGHTS: Record<string, number> = {
-  'Originality':       0.20,
-  'Clarity':           0.25,
-  'Relevance':         0.25,
-  'Media Quality':     0.15,
-  'Spelling & Grammar': 0.15,
-};
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
+export function scoreRelevance(
+  content: string,
+  topics: readonly string[] | undefined,
+): number {
+  if (!topics || topics.length === 0) {
+    // No declared topic is neutral — posters get 60 by default.
+    return 60;
+  }
+  const text = content.toLowerCase();
+  let matches = 0;
+  for (const topic of topics) {
+    const needle = topic.toLowerCase().replace(/^#/, '').trim();
+    if (!needle) continue;
+    if (text.includes(needle)) matches += 1;
+  }
+  const ratio = matches / topics.length;
+  return clamp100(40 + ratio * 60);
 }
 
-function buildExplanation(score: number, dimensions: readonly QualityDimension[]): string {
-  const topDim = [...dimensions].sort((a, b) => b.score - a.score)[0];
-  const bottomDim = [...dimensions].sort((a, b) => a.score - b.score)[0];
+export function scoreMediaQuality(
+  mediaUrls: readonly string[] | undefined,
+  content: string,
+): number {
+  const count = mediaUrls?.length ?? 0;
+  if (count === 0) {
+    // Text-only broadcasts: give credit for non-trivial length.
+    if (content.trim().length > 240) return 75;
+    if (content.trim().length > 80) return 60;
+    return 50;
+  }
+  const capped = Math.min(count, 5);
+  const excess = Math.max(0, count - 5);
+  let score = 55 + capped * 6 - excess * 8;
+  const hasImage = (mediaUrls ?? []).some((u) => /\.(png|jpe?g|webp|avif|gif)$/i.test(u));
+  const hasVideo = (mediaUrls ?? []).some((u) => /\.(mp4|webm|mov|m3u8)$/i.test(u));
+  if (hasImage) score += 5;
+  if (hasVideo) score += 10;
+  return clamp100(score);
+}
 
-  if (score >= 80) {
-    return `Excellent broadcast quality (${score}/100). Strongest dimension: ${topDim.name}.`;
+export function scoreGrammar(content: string): number {
+  const trimmed = content.trim();
+  if (trimmed.length === 0) return 0;
+
+  let penalty = 0;
+  const doubleSpaces = (trimmed.match(/ {2,}/g) ?? []).length;
+  penalty += Math.min(15, doubleSpaces * 3);
+
+  const trailing = (trimmed.match(/\s+([,.;:!?])/g) ?? []).length;
+  penalty += Math.min(12, trailing * 3);
+
+  const repeated = (trimmed.match(/([!?.]){3,}/g) ?? []).length;
+  penalty += Math.min(15, repeated * 5);
+
+  // Missing capitalisation at the start of the broadcast.
+  const first = trimmed[0];
+  if (first && first === first.toLowerCase() && /[a-z]/.test(first)) {
+    penalty += 6;
   }
-  if (score >= 60) {
-    return `Good broadcast quality (${score}/100). Focus on improving ${bottomDim.name} to reach the next tier.`;
+
+  // Common misspellings — intentionally small list, tuned to avoid false positives.
+  const misspellings = [
+    /\bteh\b/i,
+    /\brecieve\b/i,
+    /\bdefinately\b/i,
+    /\bseperate\b/i,
+    /\boccured\b/i,
+  ];
+  for (const pattern of misspellings) {
+    if (pattern.test(trimmed)) penalty += 6;
   }
-  if (score >= 40) {
-    return `Average broadcast quality (${score}/100). Key improvement areas: ${bottomDim.name} and ${dimensions.find((d) => d !== bottomDim && d.score <= 60)?.name ?? 'Clarity'}.`;
+
+  // Simple "their/there/they're" pairing — credit for correctness is given,
+  // blatant conflation penalised.
+  if (/\btheir is\b/i.test(trimmed) || /\bthere own\b/i.test(trimmed)) {
+    penalty += 10;
   }
-  return `Below-average broadcast quality (${score}/100). Significant improvements needed: ${bottomDim.name} rated ${bottomDim.score}/100 — ${bottomDim.rationale}`;
+
+  return clamp100(100 - penalty);
+}
+
+export function heuristicRating(input: BroadcastForRating): QualityFactors {
+  return {
+    originality: scoreOriginality(input.content),
+    clarity: scoreClarity(input.content),
+    relevance: scoreRelevance(input.content, input.topics),
+    mediaQuality: scoreMediaQuality(input.mediaUrls, input.content),
+    grammar: scoreGrammar(input.content),
+  };
 }
 
 // ---------------------------------------------------------------------------
-// QualityRatingAI — main class
+// Prompt builder + response parser
+// ---------------------------------------------------------------------------
+
+const SYSTEM_PROMPT =
+  'You are Gemma, an on-device language model rating the quality of a social broadcast. ' +
+  'Return STRICT JSON that matches the schema {"originality":0-100,"clarity":0-100,' +
+  '"relevance":0-100,"mediaQuality":0-100,"grammar":0-100,"explanation":"..."}. ' +
+  'No prose outside the JSON object. Scores must be integers.';
+
+export function buildPrompt(broadcast: BroadcastForRating): GemmaCompletionRequest {
+  const topics = broadcast.topics?.length
+    ? broadcast.topics.map((t) => `#${t.replace(/^#/, '')}`).join(' ')
+    : '(none declared)';
+  const media = broadcast.mediaUrls?.length
+    ? broadcast.mediaUrls.map((u) => `- ${u}`).join('\n')
+    : '(text only)';
+  const userPrompt = [
+    `Language: ${broadcast.language ?? 'en'}`,
+    `Topics: ${topics}`,
+    'Media:',
+    media,
+    'Broadcast:',
+    '```',
+    broadcast.content,
+    '```',
+    '',
+    'Rate the broadcast on the five factors and write a one-sentence explanation.',
+  ].join('\n');
+
+  return {
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userPrompt },
+    ],
+    temperature: 0.2,
+    maxTokens: 256,
+  };
+}
+
+/**
+ * Extract the first balanced `{...}` block from the model output.
+ * Gemma occasionally emits pre/post chatter; this forgiving extractor
+ * recovers the JSON payload without relying on non-standard parsers.
+ */
+export function extractJsonBlock(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+export function parseGemmaResponse(text: string): QualityFactors & { explanation: string } {
+  const block = extractJsonBlock(text);
+  if (!block) {
+    throw new Error('QualityRatingAI: model response did not contain a JSON block.');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(block);
+  } catch (err) {
+    throw new Error(
+      `QualityRatingAI: failed to JSON.parse model response: ${(err as Error).message}`,
+    );
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('QualityRatingAI: parsed response is not an object.');
+  }
+  const p = parsed as Record<string, unknown>;
+  const num = (field: string): number => {
+    const raw = p[field];
+    if (typeof raw !== 'number' || Number.isNaN(raw)) {
+      throw new Error(`QualityRatingAI: "${field}" missing or not a number.`);
+    }
+    return clamp100(raw);
+  };
+  return {
+    originality: num('originality'),
+    clarity: num('clarity'),
+    relevance: num('relevance'),
+    mediaQuality: num('mediaQuality'),
+    grammar: num('grammar'),
+    explanation:
+      typeof p.explanation === 'string' && p.explanation.length > 0
+        ? p.explanation.slice(0, 500)
+        : 'No explanation provided.',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Default heuristic-only model
+// ---------------------------------------------------------------------------
+
+class HeuristicGemmaClient implements GemmaModelClient {
+  readonly name = 'gemma-heuristic-fallback';
+  readonly isReady = (): boolean => true;
+  async complete(): Promise<GemmaCompletionResponse> {
+    throw new Error(
+      'HeuristicGemmaClient.complete called — the fallback path must be handled by QualityRatingAI directly.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// QualityRatingAI service
 // ---------------------------------------------------------------------------
 
 export class QualityRatingAI {
+  private readonly model: GemmaModelClient;
+  private readonly store: InfluenceStore;
   private readonly now: () => Date;
+  private readonly temperature: number;
+  private readonly maxTokens: number;
+  private readonly fallbackModelName: string;
+  private readonly enablePersistence: boolean;
 
-  constructor(options: QualityRatingOptions = {}) {
+  constructor(options: QualityRatingAIOptions = {}) {
+    this.model = options.model ?? new HeuristicGemmaClient();
+    this.store = options.store ?? new InMemoryInfluenceStore();
     this.now = options.now ?? (() => new Date());
+    this.temperature = clamp(options.temperature ?? 0.2, 0, 1);
+    this.maxTokens = Math.max(32, options.maxTokens ?? 256);
+    this.fallbackModelName = options.fallbackModelName ?? 'gemma-heuristic-fallback';
+    this.enablePersistence = options.enablePersistence ?? true;
   }
 
-  /**
-   * Rate broadcast content quality.
-   *
-   * @param content - Raw broadcast text.
-   * @param options - Optional runtime overrides (mediaCount, biometricVerified).
-   * @returns A QualityRating with composite score and per-dimension breakdown.
-   */
-  rate(content: string, options: QualityRatingOptions = {}): QualityRating {
-    const text = (content ?? '').trim();
-    const words = tokenise(text);
-    const sentences = splitSentences(text);
+  /** Rate a broadcast and persist the result to the store. */
+  async rateBroadcast(input: BroadcastForRating): Promise<QualityRating> {
+    this.assertInput(input);
+    const ratedAt = this.now();
+    const promptReq = buildPrompt(input);
+    const promptWithOverrides: GemmaCompletionRequest = {
+      ...promptReq,
+      temperature: this.temperature,
+      maxTokens: this.maxTokens,
+    };
 
-    const mediaCount = options.mediaCount ?? 0;
-    const biometricVerified = options.biometricVerified ?? false;
+    let factors: QualityFactors;
+    let explanation: string;
+    let modelName: string;
 
-    const dimensions: QualityDimension[] = [
-      scoreOriginality(text, words),
-      scoreClarity(sentences, words),
-      scoreRelevance(words),
-      scoreMediaQuality(mediaCount),
-      scoreSpellingGrammar(text, words),
-    ];
-
-    let composite = dimensions.reduce(
-      (sum, d) => sum + d.score * (DIMENSION_WEIGHTS[d.name] ?? 0.2),
-      0,
-    );
-
-    // Biometric uplift: +3 points for verified creators
-    if (biometricVerified) {
-      composite = Math.min(100, composite + 3);
+    try {
+      if (!this.model.isReady()) throw new Error('model not ready');
+      const response = await this.model.complete(promptWithOverrides);
+      const parsed = parseGemmaResponse(response.text);
+      factors = {
+        originality: parsed.originality,
+        clarity: parsed.clarity,
+        relevance: parsed.relevance,
+        mediaQuality: parsed.mediaQuality,
+        grammar: parsed.grammar,
+      };
+      explanation = parsed.explanation;
+      modelName = response.modelName || this.model.name;
+    } catch (err) {
+      influenceLog(
+        'warn',
+        {
+          broadcastId: input.broadcastId,
+          error: (err as Error).message,
+          model: this.model.name,
+        },
+        'QualityRatingAI falling back to heuristic rater',
+      );
+      factors = heuristicRating(input);
+      explanation = this.composeHeuristicExplanation(factors);
+      modelName = this.fallbackModelName;
     }
 
-    const score = Math.round(clamp(composite, 0, 100));
-    const explanation = buildExplanation(score, dimensions);
-
-    const textStats: TextStats = {
-      charCount: text.length,
-      wordCount: words.length,
-      sentenceCount: sentences.length,
-      avgWordLength:
-        words.length > 0
-          ? Math.round((words.reduce((s, w) => s + w.length, 0) / words.length) * 10) / 10
-          : 0,
-      avgSentenceLength:
-        sentences.length > 0
-          ? Math.round((words.length / sentences.length) * 10) / 10
-          : 0,
-      uniqueWordRatio:
-        words.length > 0
-          ? Math.round((new Set(words).size / words.length) * 1000) / 1000
-          : 0,
-    };
-
+    const score = aggregateFactors(factors);
     const rating: QualityRating = {
       score,
+      ...factors,
       explanation,
-      dimensions,
-      ratedAt: this.now().toISOString(),
-      textStats,
+      modelName,
+      ratedAt,
+      broadcastId: input.broadcastId,
+      authorId: input.authorId,
     };
 
-    logger.debug(
-      { score, wordCount: words.length, mediaCount },
-      'QualityRatingAI broadcast rated',
+    if (this.enablePersistence) {
+      await this.persistRating(rating);
+    }
+
+    influenceLog(
+      'info',
+      {
+        broadcastId: input.broadcastId,
+        authorId: input.authorId,
+        score,
+        model: modelName,
+      },
+      'QualityRatingAI produced rating',
     );
 
     return rating;
+  }
+
+  /**
+   * Convenience helper — returns just the aggregate score (0–100).
+   */
+  async rateBroadcastScore(input: BroadcastForRating): Promise<number> {
+    const rating = await this.rateBroadcast(input);
+    return rating.score;
+  }
+
+  /** Rate several broadcasts sequentially. Returns in input order. */
+  async rateBroadcasts(
+    inputs: readonly BroadcastForRating[],
+  ): Promise<readonly QualityRating[]> {
+    const out: QualityRating[] = [];
+    for (const item of inputs) {
+      out.push(await this.rateBroadcast(item));
+    }
+    return out;
+  }
+
+  /**
+   * Compute the running average quality for a given author across
+   * their most recent `limit` broadcasts. Returns 0 when the author
+   * has no ratings yet.
+   */
+  async averageQualityForAuthor(authorId: string, limit = 20): Promise<number> {
+    const ratings = await this.store.listBroadcastQualityRatings(authorId, limit);
+    if (ratings.length === 0) return 0;
+    const sum = ratings.reduce((acc, r) => acc + r.score, 0);
+    return Math.round(sum / ratings.length);
+  }
+
+  /** Return the most recent ratings for an author. */
+  async recentRatings(
+    authorId: string,
+    limit = 10,
+  ): Promise<readonly BroadcastQualityRatingRecord[]> {
+    return this.store.listBroadcastQualityRatings(authorId, limit);
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  private composeHeuristicExplanation(factors: QualityFactors): string {
+    const pairs: Array<[keyof QualityFactors, string]> = [
+      ['originality', 'originality'],
+      ['clarity', 'clarity'],
+      ['relevance', 'topical relevance'],
+      ['mediaQuality', 'media quality'],
+      ['grammar', 'grammar'],
+    ];
+    const strongest = [...pairs].sort(
+      (a, b) => factors[b[0]] - factors[a[0]],
+    )[0];
+    const weakest = [...pairs].sort(
+      (a, b) => factors[a[0]] - factors[b[0]],
+    )[0];
+    return (
+      `Heuristic fallback: strongest on ${strongest[1]} (${factors[strongest[0]]}), ` +
+      `weakest on ${weakest[1]} (${factors[weakest[0]]}).`
+    );
+  }
+
+  private assertInput(input: BroadcastForRating): void {
+    if (!input.broadcastId) {
+      throw new Error('QualityRatingAI: broadcastId is required.');
+    }
+    if (!input.authorId) {
+      throw new Error('QualityRatingAI: authorId is required.');
+    }
+    if (typeof input.content !== 'string') {
+      throw new Error('QualityRatingAI: content must be a string.');
+    }
+    if (input.content.length > 5000) {
+      throw new Error('QualityRatingAI: content exceeds 5000 characters.');
+    }
+  }
+
+  private async persistRating(rating: QualityRating): Promise<void> {
+    try {
+      await this.store.upsertBroadcastQualityRating({
+        authorId: rating.authorId,
+        broadcastId: rating.broadcastId,
+        score: rating.score,
+        originality: rating.originality,
+        clarity: rating.clarity,
+        relevance: rating.relevance,
+        mediaQuality: rating.mediaQuality,
+        grammar: rating.grammar,
+        explanation: rating.explanation,
+        modelName: rating.modelName,
+      });
+    } catch (err) {
+      influenceLog(
+        'error',
+        { error: (err as Error).message, broadcastId: rating.broadcastId },
+        'QualityRatingAI failed to persist rating',
+      );
+    }
   }
 }
 
