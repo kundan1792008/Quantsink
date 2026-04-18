@@ -449,22 +449,23 @@ export class LiveQAService {
   }
 
   private recompute(question: Question, patch: Partial<Question>): Question {
-    const merged: Question = {
+    const upvotes = patch.upvotes ?? question.upvotes;
+    const pinned = patch.pinned ?? question.pinned;
+    const createdAt = question.createdAt;
+    return Object.freeze({
       id: question.id,
       broadcastId: question.broadcastId,
       authorId: question.authorId,
       authorDisplayName: question.authorDisplayName,
       body: question.body,
-      upvotes: patch.upvotes ?? question.upvotes,
+      upvotes,
       state: patch.state ?? question.state,
-      pinned: patch.pinned ?? question.pinned,
-      createdAt: question.createdAt,
+      pinned,
+      createdAt,
       answeredAt: patch.answeredAt !== undefined ? patch.answeredAt : question.answeredAt,
       hiddenAt: patch.hiddenAt !== undefined ? patch.hiddenAt : question.hiddenAt,
-      score: 0,
-    };
-    merged.score = computeScore(merged);
-    return Object.freeze(merged);
+      score: computeScore({ upvotes, pinned, createdAt }),
+    });
   }
 
   private buildSnapshot(state: BroadcastQAState): QuestionListSnapshot {
