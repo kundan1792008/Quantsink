@@ -1,510 +1,490 @@
 /**
- * PersonalizedFeedAI
+ * PersonalizedFeedAI — Hybrid Feed Ranker
  *
- * Builds a personalised ranked feed for each user by combining:
+ * Builds a per-user interest graph from four signals —
+ *   1. View history
+ *   2. Like history
+ *   3. Follow graph
+ *   4. Broadcast topics (TF-IDF features)
  *
- *   1. Content-based filtering — topic similarity via cosine similarity on
- *      TF-IDF vectors derived from the user's interest profile.
+ * and produces a ranked feed by combining two classical recommendation
+ * strategies:
  *
- *   2. Collaborative filtering — "users like you also engaged with …"
- *      signal sourced from aggregated co-engagement matrices.
+ *   • **Collaborative filtering** — cosine similarity between user
+ *     interaction vectors ("users like you also watched X").
+ *   • **Content-based filtering** — cosine similarity between a user's
+ *     aggregate topic vector and each candidate broadcast's TF-IDF vector.
  *
- *   3. Hybrid ranking — both signals are blended with time-decay weighting
- *      so recency is always a strong positive factor.
+ * The hybrid ranker blends both scores with a configurable weighting and
+ * applies a logarithmic time-decay so that fresh content is consistently
+ * surfaced ahead of stale winners.
  *
- * The class is designed to be deterministic and fully unit-testable; inject
- * a `now` clock to control time in tests.
+ * The service is deterministic — all time primitives are injectable — and
+ * is fully unit-testable without heavy data or network dependencies.
  */
 
 import logger from '../lib/logger';
+import { tokenise } from './TrendPredictor';
+import type { BroadcastRecord } from './TrendPredictor';
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-export interface UserInterestGraph {
-  /** Unique user identifier. */
+export interface InteractionEvent {
+  /** User that performed the interaction. */
   readonly userId: string;
-  /** IDs of broadcasts the user has viewed, in order of recency (newest first). */
-  readonly viewHistory: readonly string[];
-  /** IDs of broadcasts the user has liked. */
-  readonly likeHistory: readonly string[];
-  /** IDs of users this user follows. */
-  readonly followedUserIds: readonly string[];
-  /** Explicit topic preferences set by the user (e.g. "machine learning"). */
-  readonly explicitTopics: readonly string[];
-}
-
-export interface BroadcastItem {
-  /** Unique broadcast identifier. */
-  readonly id: string;
-  /** Raw text content. */
-  readonly content: string;
-  /** Author user ID. */
-  readonly authorId: string;
-  /** UTC epoch ms of publication. */
-  readonly publishedAt: number;
-  /** Cumulative engagement count. */
-  readonly engagementCount: number;
-  /** Optional pre-computed tags / categories. */
-  readonly tags?: readonly string[];
-}
-
-export interface RankedItem {
+  /** Broadcast that received the interaction. */
   readonly broadcastId: string;
-  /** Final hybrid score (higher = more relevant). */
+  /** Kind of interaction. */
+  readonly kind: 'view' | 'like' | 'reshare' | 'reply' | 'save';
+  /** When the interaction occurred. */
+  readonly at: Date;
+  /** Optional dwell-time in milliseconds for view events. */
+  readonly dwellMs?: number;
+}
+
+export interface FollowEdge {
+  readonly followerId: string;
+  readonly followeeId: string;
+  /** Optional affinity weight, default 1. */
+  readonly weight?: number;
+}
+
+export interface UserInterestProfile {
+  readonly userId: string;
+  /** Topic → weight (L2-normalised). */
+  readonly topicVector: ReadonlyMap<string, number>;
+  /** Broadcast ids the user has interacted with. */
+  readonly interactedBroadcastIds: ReadonlySet<string>;
+  /** Authors the user follows. */
+  readonly followedAuthorIds: ReadonlySet<string>;
+  /** Updated-at ISO timestamp. */
+  readonly updatedAt: string;
+  /** Total interactions considered during profile build. */
+  readonly interactionCount: number;
+}
+
+export interface RankedBroadcast {
+  readonly broadcast: BroadcastRecord;
+  /** Final blended score, 0..1+. */
   readonly score: number;
-  /** Content-based similarity contribution. */
+  /** Content-based component. */
   readonly contentScore: number;
-  /** Collaborative filtering contribution. */
+  /** Collaborative component. */
   readonly collaborativeScore: number;
-  /** Time-decay multiplier applied (0-1). */
-  readonly timeDecay: number;
-  /** Human-readable reason for inclusion. */
-  readonly reason: string;
+  /** Recency weight. */
+  readonly recencyWeight: number;
+  /** Whether the author is followed. */
+  readonly followedAuthor: boolean;
+  /** Reasons surfaced to the UI (human-readable). */
+  readonly reasons: readonly string[];
 }
 
-export interface PersonalizedFeedResult {
+export interface FeedRankResult {
   readonly userId: string;
+  readonly ranked: readonly RankedBroadcast[];
   readonly generatedAt: string;
-  /** Ordered list of recommended broadcasts (most relevant first). */
-  readonly rankedItems: readonly RankedItem[];
-  /** Number of candidate items evaluated. */
-  readonly candidateCount: number;
-}
-
-export interface CoEngagementEntry {
-  /** User ID. */
-  readonly userId: string;
-  /** Broadcast IDs this user has engaged with. */
-  readonly engagedBroadcasts: readonly string[];
+  readonly blendWeights: {
+    readonly content: number;
+    readonly collaborative: number;
+    readonly recency: number;
+    readonly follow: number;
+  };
 }
 
 export interface PersonalizedFeedAIOptions {
-  /** Injected clock (epoch ms). */
-  readonly now?: () => number;
-  /** Weight for content-based signal in hybrid blend (0-1, default 0.5). */
+  readonly now?: () => Date;
+  /** 0..1 share of the score attributed to content-based filtering. */
   readonly contentWeight?: number;
-  /** Weight for collaborative signal in hybrid blend (0-1, default 0.5). */
+  /** 0..1 share attributed to collaborative filtering. */
   readonly collaborativeWeight?: number;
-  /** Half-life for time decay in milliseconds (default: 12 hours). */
-  readonly timeDecayHalfLifeMs?: number;
-  /** Maximum feed size to return (default: 20). */
-  readonly feedSize?: number;
+  /** 0..1 share attributed to recency. */
+  readonly recencyWeight?: number;
+  /** 0..1 share for a direct follow-graph bonus. */
+  readonly followWeight?: number;
+  /** Temporal half-life in hours for content recency. Default 8. */
+  readonly recencyHalfLifeHours?: number;
+  /** Nearest-neighbour pool size for collaborative filtering. Default 40. */
+  readonly neighbourPoolSize?: number;
+  /** Minimum similarity for a neighbour to qualify. Default 0.05. */
+  readonly minNeighbourSimilarity?: number;
+  /** How many broadcasts to return in rank(). Default 50. */
+  readonly topK?: number;
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers — tokenisation & TF-IDF
+// Constants
 // ---------------------------------------------------------------------------
 
-const STOP_WORDS_CF = new Set([
-  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-  'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
-  'have', 'has', 'do', 'does', 'will', 'would', 'can', 'could', 'not',
-  'this', 'that', 'it', 'its', 'we', 'you', 'he', 'she', 'they', 'all',
-]);
+const INTERACTION_WEIGHTS: Record<InteractionEvent['kind'], number> = {
+  view: 1,
+  like: 3,
+  reshare: 5,
+  reply: 4,
+  save: 6,
+};
 
-function tokeniseCF(text: string): string[] {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, ' ')
-    .split(/\s+/)
-    .filter((t) => t.length >= 3 && !STOP_WORDS_CF.has(t));
+// ---------------------------------------------------------------------------
+// Math helpers
+// ---------------------------------------------------------------------------
+
+function dot(a: ReadonlyMap<string, number>, b: ReadonlyMap<string, number>): number {
+  // Iterate the smaller map for efficiency.
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  let sum = 0;
+  for (const [key, value] of small.entries()) {
+    const other = large.get(key);
+    if (other !== undefined) sum += value * other;
+  }
+  return sum;
 }
 
-/** Build TF vector (term → normalised frequency) for a document. */
-function buildTFVector(tokens: string[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const t of tokens) {
-    counts.set(t, (counts.get(t) ?? 0) + 1);
-  }
-  const total = tokens.length || 1;
-  const tf = new Map<string, number>();
-  for (const [term, c] of counts) {
-    tf.set(term, c / total);
-  }
-  return tf;
+function magnitude(vec: ReadonlyMap<string, number>): number {
+  let sum = 0;
+  for (const v of vec.values()) sum += v * v;
+  return Math.sqrt(sum);
 }
 
-/** Compute smoothed IDF over a collection of token lists. */
-function buildIDF(allTokenSets: string[][]): Map<string, number> {
-  const N = allTokenSets.length;
-  const df = new Map<string, number>();
-  for (const tokens of allTokenSets) {
-    for (const t of new Set(tokens)) {
-      df.set(t, (df.get(t) ?? 0) + 1);
-    }
-  }
-  const idf = new Map<string, number>();
-  for (const [term, docFreq] of df) {
-    idf.set(term, Math.log((1 + N) / (1 + docFreq)) + 1);
-  }
-  return idf;
+function cosine(a: ReadonlyMap<string, number>, b: ReadonlyMap<string, number>): number {
+  const magA = magnitude(a);
+  const magB = magnitude(b);
+  if (magA === 0 || magB === 0) return 0;
+  return dot(a, b) / (magA * magB);
 }
 
-/** Convert TF map + IDF map into a TF-IDF vector (term → tfidf weight). */
-function tfidfVector(tf: Map<string, number>, idf: Map<string, number>): Map<string, number> {
-  const vec = new Map<string, number>();
-  for (const [term, tfVal] of tf) {
-    vec.set(term, tfVal * (idf.get(term) ?? 1));
+function normalise(vec: Map<string, number>): Map<string, number> {
+  const mag = magnitude(vec);
+  if (mag === 0) return vec;
+  for (const [key, value] of vec.entries()) {
+    vec.set(key, value / mag);
   }
   return vec;
 }
 
-/**
- * Cosine similarity between two sparse TF-IDF vectors.
- * Returns a value in [0, 1].
- */
-function cosineSimilarity(a: Map<string, number>, b: Map<string, number>): number {
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-
-  for (const [term, aVal] of a) {
-    normA += aVal * aVal;
-    const bVal = b.get(term);
-    if (bVal !== undefined) {
-      dot += aVal * bVal;
-    }
+function addScaled(
+  target: Map<string, number>,
+  source: ReadonlyMap<string, number>,
+  scale: number,
+): void {
+  for (const [key, value] of source.entries()) {
+    target.set(key, (target.get(key) ?? 0) + value * scale);
   }
-  for (const [, bVal] of b) {
-    normB += bVal * bVal;
-  }
-
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  return denom === 0 ? 0 : dot / denom;
 }
 
-/**
- * Exponential time-decay factor.
- * Returns 1.0 for brand-new content and approaches 0 as age → ∞.
- * Half-life: the age at which decay = 0.5.
- */
-function timeDecayFactor(publishedAt: number, nowMs: number, halfLifeMs: number): number {
-  const ageMs = Math.max(0, nowMs - publishedAt);
-  return Math.pow(0.5, ageMs / halfLifeMs);
+function computeRecencyWeight(
+  postedAt: Date,
+  now: Date,
+  halfLifeHours: number,
+): number {
+  const ageHours = Math.max(0, (now.getTime() - postedAt.getTime()) / 3_600_000);
+  return Math.pow(0.5, ageHours / Math.max(0.25, halfLifeHours));
 }
 
-// ---------------------------------------------------------------------------
-// Interest profile builder
-// ---------------------------------------------------------------------------
-
-/**
- * Aggregate user signals into a single weighted interest TF-IDF vector.
- * Like history is weighted 3×, view history 1×, explicit topics 2×.
- */
-function buildInterestVector(
-  user: UserInterestGraph,
-  broadcastMap: Map<string, BroadcastItem>,
-  idf: Map<string, number>,
-): Map<string, number> {
-  const weightedTerms = new Map<string, number>();
-
-  const addTerms = (broadcastId: string, weight: number): void => {
-    const item = broadcastMap.get(broadcastId);
-    if (!item) return;
-    const tokens = tokeniseCF(item.content + ' ' + (item.tags ?? []).join(' '));
-    const tf = buildTFVector(tokens);
-    for (const [term, tfVal] of tf) {
-      const idfVal = idf.get(term) ?? 1;
-      weightedTerms.set(term, (weightedTerms.get(term) ?? 0) + tfVal * idfVal * weight);
-    }
-  };
-
-  // View history — weight 1, capped at 50 most recent
-  const recentViews = user.viewHistory.slice(0, 50);
-  for (const id of recentViews) addTerms(id, 1);
-
-  // Like history — weight 3 (strong positive signal)
-  for (const id of user.likeHistory) addTerms(id, 3);
-
-  // Explicit topic preferences — injected as synthetic pseudo-documents
-  if (user.explicitTopics.length > 0) {
-    const syntheticContent = user.explicitTopics.join(' ');
-    const tokens = tokeniseCF(syntheticContent);
-    const tf = buildTFVector(tokens);
-    for (const [term, tfVal] of tf) {
-      const idfVal = idf.get(term) ?? 1;
-      weightedTerms.set(term, (weightedTerms.get(term) ?? 0) + tfVal * idfVal * 2);
-    }
+function broadcastVector(broadcast: BroadcastRecord): Map<string, number> {
+  const tokens = tokenise(broadcast.text);
+  const vec = new Map<string, number>();
+  for (const t of tokens) {
+    vec.set(t, (vec.get(t) ?? 0) + 1);
   }
-
-  return weightedTerms;
+  for (const tag of broadcast.tags ?? []) {
+    const clean = tag.toLowerCase().trim();
+    if (clean) vec.set(clean, (vec.get(clean) ?? 0) + 2);
+  }
+  return vec;
 }
 
 // ---------------------------------------------------------------------------
-// Collaborative filtering helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Jaccard similarity between two sets of broadcast IDs.
- * Range: [0, 1].
- */
-function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
-  if (a.size === 0 && b.size === 0) return 0;
-  let intersection = 0;
-  for (const id of a) {
-    if (b.has(id)) intersection++;
-  }
-  const union = a.size + b.size - intersection;
-  return union === 0 ? 0 : intersection / union;
-}
-
-/**
- * Build a set of "recommended by similar users" broadcast IDs with scores.
- *
- * Algorithm:
- *  1. For each peer user, compute Jaccard similarity with the target user's
- *     engagement set (views + likes).
- *  2. Weight each peer's unseen broadcasts by peer similarity.
- *  3. Aggregate and normalise to [0, 1].
- */
-function collaborativeScores(
-  targetUser: UserInterestGraph,
-  peers: readonly CoEngagementEntry[],
-  seenIds: Set<string>,
-): Map<string, number> {
-  const targetSet = new Set([...targetUser.viewHistory, ...targetUser.likeHistory]);
-  const rawScores = new Map<string, number>();
-
-  let totalSimilarity = 0;
-
-  for (const peer of peers) {
-    if (peer.userId === targetUser.userId) continue;
-    const peerSet = new Set(peer.engagedBroadcasts);
-    const sim = jaccardSimilarity(targetSet, peerSet);
-    if (sim === 0) continue;
-    totalSimilarity += sim;
-    for (const bId of peerSet) {
-      if (!seenIds.has(bId)) {
-        rawScores.set(bId, (rawScores.get(bId) ?? 0) + sim);
-      }
-    }
-  }
-
-  // Normalise by total similarity to keep scores in [0, 1]
-  if (totalSimilarity === 0) return new Map();
-  const normalised = new Map<string, number>();
-  for (const [id, score] of rawScores) {
-    normalised.set(id, score / totalSimilarity);
-  }
-  return normalised;
-}
-
-// ---------------------------------------------------------------------------
-// PersonalizedFeedAI
+// PersonalizedFeedAI class
 // ---------------------------------------------------------------------------
 
 export class PersonalizedFeedAI {
-  private readonly now: () => number;
+  private readonly now: () => Date;
   private readonly contentWeight: number;
   private readonly collaborativeWeight: number;
-  private readonly timeDecayHalfLifeMs: number;
-  private readonly feedSize: number;
+  private readonly recencyWeight: number;
+  private readonly followWeight: number;
+  private readonly recencyHalfLifeHours: number;
+  private readonly neighbourPoolSize: number;
+  private readonly minNeighbourSimilarity: number;
+  private readonly topK: number;
+
+  /** Cached user profiles, keyed by userId. */
+  private readonly profiles: Map<string, UserInterestProfile> = new Map();
+  /**
+   * Cached user interaction vectors (per user → map of broadcastId → weight)
+   * used for collaborative filtering neighbour lookups.
+   */
+  private readonly userInteractionVectors: Map<string, Map<string, number>> =
+    new Map();
 
   constructor(options: PersonalizedFeedAIOptions = {}) {
-    this.now = options.now ?? (() => Date.now());
-    this.contentWeight = options.contentWeight ?? 0.5;
-    this.collaborativeWeight = options.collaborativeWeight ?? 0.5;
-    this.timeDecayHalfLifeMs = options.timeDecayHalfLifeMs ?? 12 * 60 * 60 * 1_000;
-    this.feedSize = options.feedSize ?? 20;
+    this.now = options.now ?? (() => new Date());
 
-    if (Math.abs(this.contentWeight + this.collaborativeWeight - 1) > 0.001) {
-      throw new Error(
-        `PersonalizedFeedAI: contentWeight (${this.contentWeight}) + collaborativeWeight (${this.collaborativeWeight}) must sum to 1`,
-      );
+    // Normalise blend weights to sum 1.
+    const rawContentWeight = options.contentWeight ?? 0.45;
+    const rawCollaborativeWeight = options.collaborativeWeight ?? 0.3;
+    const rawRecencyWeight = options.recencyWeight ?? 0.15;
+    const rawFollowWeight = options.followWeight ?? 0.1;
+    const total =
+      rawContentWeight + rawCollaborativeWeight + rawRecencyWeight + rawFollowWeight;
+    if (total <= 0) {
+      throw new Error('Blend weights must sum to a positive number');
     }
+    this.contentWeight = rawContentWeight / total;
+    this.collaborativeWeight = rawCollaborativeWeight / total;
+    this.recencyWeight = rawRecencyWeight / total;
+    this.followWeight = rawFollowWeight / total;
+
+    this.recencyHalfLifeHours = options.recencyHalfLifeHours ?? 8;
+    this.neighbourPoolSize = options.neighbourPoolSize ?? 40;
+    this.minNeighbourSimilarity = options.minNeighbourSimilarity ?? 0.05;
+    this.topK = options.topK ?? 50;
   }
 
-  // -------------------------------------------------------------------------
-  // Primary API
-  // -------------------------------------------------------------------------
+  /**
+   * Rebuild (or create) a user's interest profile from the supplied signals.
+   * Call this any time the user interacts meaningfully with the feed.
+   */
+  buildProfile(
+    userId: string,
+    interactions: readonly InteractionEvent[],
+    broadcasts: readonly BroadcastRecord[],
+    follows: readonly FollowEdge[],
+  ): UserInterestProfile {
+    const broadcastMap = new Map(broadcasts.map((b) => [b.id, b]));
+
+    const topicAcc = new Map<string, number>();
+    const interactedBroadcastIds = new Set<string>();
+    const interactionVec = new Map<string, number>();
+
+    const nowDate = this.now();
+    let interactionCount = 0;
+
+    for (const event of interactions) {
+      if (event.userId !== userId) continue;
+      interactionCount += 1;
+      interactedBroadcastIds.add(event.broadcastId);
+
+      const weightBase = INTERACTION_WEIGHTS[event.kind] ?? 1;
+      const dwellBonus = event.dwellMs
+        ? Math.min(3, Math.log1p(event.dwellMs / 1000))
+        : 0;
+      const recency = computeRecencyWeight(event.at, nowDate, 48);
+      const weight = (weightBase + dwellBonus) * recency;
+
+      interactionVec.set(
+        event.broadcastId,
+        (interactionVec.get(event.broadcastId) ?? 0) + weight,
+      );
+
+      const broadcast = broadcastMap.get(event.broadcastId);
+      if (broadcast) {
+        const bVec = broadcastVector(broadcast);
+        addScaled(topicAcc, bVec, weight);
+      }
+    }
+
+    const topicVector = normalise(topicAcc);
+
+    const followedAuthorIds = new Set<string>();
+    for (const edge of follows) {
+      if (edge.followerId === userId) {
+        followedAuthorIds.add(edge.followeeId);
+      }
+    }
+
+    const profile: UserInterestProfile = {
+      userId,
+      topicVector,
+      interactedBroadcastIds,
+      followedAuthorIds,
+      updatedAt: nowDate.toISOString(),
+      interactionCount,
+    };
+
+    this.profiles.set(userId, profile);
+    this.userInteractionVectors.set(userId, interactionVec);
+
+    logger.debug(
+      {
+        userId,
+        topicVectorSize: topicVector.size,
+        followedAuthors: followedAuthorIds.size,
+        interactions: interactionCount,
+      },
+      'PersonalizedFeedAI profile rebuilt',
+    );
+
+    return profile;
+  }
+
+  /** Rebuild every profile contained within the supplied signals. */
+  buildAllProfiles(
+    interactions: readonly InteractionEvent[],
+    broadcasts: readonly BroadcastRecord[],
+    follows: readonly FollowEdge[],
+  ): UserInterestProfile[] {
+    const userIds = new Set<string>();
+    for (const e of interactions) userIds.add(e.userId);
+    for (const edge of follows) userIds.add(edge.followerId);
+    const profiles: UserInterestProfile[] = [];
+    for (const userId of userIds) {
+      profiles.push(this.buildProfile(userId, interactions, broadcasts, follows));
+    }
+    return profiles;
+  }
+
+  /** Read-only accessor for a profile. */
+  getProfile(userId: string): UserInterestProfile | null {
+    return this.profiles.get(userId) ?? null;
+  }
 
   /**
-   * Generate a personalised, ranked feed for the given user.
-   *
-   * @param user         The target user's interest graph.
-   * @param candidates   Broadcast items to rank.
-   * @param peers        Co-engagement data from similar users (for collaborative filtering).
-   * @returns            Ranked feed result with up to `feedSize` items.
+   * Rank a pool of candidate broadcasts for the given user.  Candidates
+   * already interacted with are demoted (not strictly removed) so they can
+   * still surface when nothing else is relevant.
    */
-  rankFeed(
-    user: UserInterestGraph,
-    candidates: readonly BroadcastItem[],
-    peers: readonly CoEngagementEntry[] = [],
-  ): PersonalizedFeedResult {
-    const nowMs = this.now();
-    const broadcastMap = new Map<string, BroadcastItem>(candidates.map((b) => [b.id, b]));
+  rank(
+    userId: string,
+    candidates: readonly BroadcastRecord[],
+    options: { topK?: number } = {},
+  ): FeedRankResult {
+    const nowDate = this.now();
+    const profile = this.profiles.get(userId);
+    const userVec = this.userInteractionVectors.get(userId) ?? new Map();
 
-    // 1. Build corpus-wide IDF over all candidates
-    const allTokenSets = candidates.map((b) =>
-      tokeniseCF(b.content + ' ' + (b.tags ?? []).join(' ')),
-    );
-    const idf = buildIDF(allTokenSets);
+    const topK = options.topK ?? this.topK;
+    const neighbours = this.findNeighbours(userId, userVec);
 
-    // 2. Build the user's interest vector
-    const interestVec = buildInterestVector(user, broadcastMap, idf);
+    const ranked: RankedBroadcast[] = candidates.map((broadcast) => {
+      const reasons: string[] = [];
+      const bVec = broadcastVector(broadcast);
 
-    // 3. Compute collaborative scores for unseen broadcasts
-    const seenIds = new Set([...user.viewHistory, ...user.likeHistory]);
-    const collabScores = collaborativeScores(user, peers, seenIds);
+      const contentScore = profile
+        ? cosine(profile.topicVector, bVec)
+        : 0;
+      if (contentScore > 0.2) {
+        reasons.push('Matches your interest graph');
+      }
 
-    // 4. Score every candidate
-    const ranked: RankedItem[] = [];
+      let collabNumer = 0;
+      let collabDenom = 0;
+      for (const [neighbourId, similarity] of neighbours) {
+        const vec = this.userInteractionVectors.get(neighbourId);
+        const interactionWeight = vec?.get(broadcast.id) ?? 0;
+        if (interactionWeight <= 0) continue;
+        collabNumer += similarity * interactionWeight;
+        collabDenom += similarity;
+      }
+      const rawCollab =
+        collabDenom > 0 ? collabNumer / collabDenom : 0;
+      const collaborativeScore = Math.min(1, rawCollab / 10);
+      if (collaborativeScore > 0.1) {
+        reasons.push('Users with taste like yours are engaging');
+      }
 
-    for (let i = 0; i < candidates.length; i++) {
-      const broadcast = candidates[i];
-      const tokens = allTokenSets[i];
-      const tf = buildTFVector(tokens);
-      const broadcastVec = tfidfVector(tf, idf);
+      const recency = computeRecencyWeight(
+        new Date(broadcast.postedAt),
+        nowDate,
+        this.recencyHalfLifeHours,
+      );
 
-      const contentScore = cosineSimilarity(interestVec, broadcastVec);
-      const collabScore = collabScores.get(broadcast.id) ?? 0;
-      const decay = timeDecayFactor(broadcast.publishedAt, nowMs, this.timeDecayHalfLifeMs);
+      const followed =
+        profile?.followedAuthorIds.has(broadcast.authorId) ?? false;
+      if (followed) reasons.push('From someone you follow');
 
-      const hybrid =
-        (this.contentWeight * contentScore + this.collaborativeWeight * collabScore) * decay;
+      // Demote already-consumed content.
+      const alreadySeen =
+        profile?.interactedBroadcastIds.has(broadcast.id) ?? false;
+      const seenPenalty = alreadySeen ? 0.4 : 1;
 
-      const reason = this.buildReason(contentScore, collabScore, decay, seenIds.has(broadcast.id));
+      const score =
+        (this.contentWeight * contentScore +
+          this.collaborativeWeight * collaborativeScore +
+          this.recencyWeight * recency +
+          this.followWeight * (followed ? 1 : 0)) *
+        seenPenalty;
 
-      ranked.push({
-        broadcastId: broadcast.id,
-        score: hybrid,
-        contentScore,
-        collaborativeScore: collabScore,
-        timeDecay: decay,
-        reason,
-      });
-    }
+      return {
+        broadcast,
+        score: Math.round(score * 10_000) / 10_000,
+        contentScore: Math.round(contentScore * 10_000) / 10_000,
+        collaborativeScore: Math.round(collaborativeScore * 10_000) / 10_000,
+        recencyWeight: Math.round(recency * 10_000) / 10_000,
+        followedAuthor: followed,
+        reasons,
+      };
+    });
 
     ranked.sort((a, b) => b.score - a.score);
 
-    const result: PersonalizedFeedResult = {
-      userId: user.userId,
-      generatedAt: new Date(nowMs).toISOString(),
-      rankedItems: ranked.slice(0, this.feedSize),
-      candidateCount: candidates.length,
+    const result: FeedRankResult = {
+      userId,
+      ranked: ranked.slice(0, topK),
+      generatedAt: nowDate.toISOString(),
+      blendWeights: {
+        content: this.contentWeight,
+        collaborative: this.collaborativeWeight,
+        recency: this.recencyWeight,
+        follow: this.followWeight,
+      },
     };
 
     logger.debug(
-      { userId: user.userId, candidateCount: candidates.length, topScore: ranked[0]?.score ?? 0 },
-      'PersonalizedFeedAI feed ranked',
+      {
+        userId,
+        candidates: candidates.length,
+        returned: result.ranked.length,
+        topScore: result.ranked[0]?.score ?? 0,
+      },
+      'PersonalizedFeedAI ranked feed',
     );
 
     return result;
   }
 
-  // -------------------------------------------------------------------------
-  // Incremental / streaming ranking
-  // -------------------------------------------------------------------------
-
   /**
-   * Re-score a single broadcast item against an existing interest vector.
-   * Useful for live feed updates without rebuilding the full corpus.
+   * Compute cosine similarity between two users' interaction vectors.
+   * Exposed for testing and analytics.
    */
-  scoreItem(
-    interestVector: Map<string, number>,
-    broadcast: BroadcastItem,
-    idf: Map<string, number>,
-  ): number {
-    const tokens = tokeniseCF(broadcast.content + ' ' + (broadcast.tags ?? []).join(' '));
-    const tf = buildTFVector(tokens);
-    const broadcastVec = tfidfVector(tf, idf);
-    const contentScore = cosineSimilarity(interestVector, broadcastVec);
-    const decay = timeDecayFactor(broadcast.publishedAt, this.now(), this.timeDecayHalfLifeMs);
-    return contentScore * decay;
+  userSimilarity(userA: string, userB: string): number {
+    const a = this.userInteractionVectors.get(userA);
+    const b = this.userInteractionVectors.get(userB);
+    if (!a || !b) return 0;
+    return cosine(a, b);
   }
 
-  /**
-   * Compute and expose the IDF map for a set of candidates.
-   * Needed when calling `scoreItem` incrementally.
-   */
-  buildCorpusIDF(candidates: readonly BroadcastItem[]): Map<string, number> {
-    const tokenSets = candidates.map((b) =>
-      tokeniseCF(b.content + ' ' + (b.tags ?? []).join(' ')),
-    );
-    return buildIDF(tokenSets);
-  }
-
-  /**
-   * Build and expose the user interest vector.
-   * Needed when calling `scoreItem` incrementally.
-   */
-  buildUserInterestVector(
-    user: UserInterestGraph,
-    broadcastMap: Map<string, BroadcastItem>,
-    idf: Map<string, number>,
-  ): Map<string, number> {
-    return buildInterestVector(user, broadcastMap, idf);
-  }
-
-  // -------------------------------------------------------------------------
-  // Interest graph analysis
-  // -------------------------------------------------------------------------
-
-  /**
-   * Return the top-N terms from the user's interest vector.
-   * Useful for debugging and for building topic labels in the UI.
-   */
-  topInterestTerms(
-    user: UserInterestGraph,
-    candidates: readonly BroadcastItem[],
-    topN = 10,
-  ): Array<{ term: string; weight: number }> {
-    const broadcastMap = new Map<string, BroadcastItem>(candidates.map((b) => [b.id, b]));
-    const allTokenSets = candidates.map((b) =>
-      tokeniseCF(b.content + ' ' + (b.tags ?? []).join(' ')),
-    );
-    const idf = buildIDF(allTokenSets);
-    const vec = buildInterestVector(user, broadcastMap, idf);
-
-    return [...vec.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, topN)
-      .map(([term, weight]) => ({ term, weight }));
-  }
-
-  /**
-   * Compute pairwise user similarity scores between a target user and a list
-   * of peers.  Returns sorted by similarity descending.
-   */
-  findSimilarUsers(
-    target: UserInterestGraph,
-    peers: readonly CoEngagementEntry[],
-  ): Array<{ userId: string; similarity: number }> {
-    const targetSet = new Set([...target.viewHistory, ...target.likeHistory]);
-    const results: Array<{ userId: string; similarity: number }> = [];
-
-    for (const peer of peers) {
-      if (peer.userId === target.userId) continue;
-      const peerSet = new Set(peer.engagedBroadcasts);
-      const sim = jaccardSimilarity(targetSet, peerSet);
-      if (sim > 0) results.push({ userId: peer.userId, similarity: sim });
+  private findNeighbours(
+    userId: string,
+    userVec: ReadonlyMap<string, number>,
+  ): Array<[string, number]> {
+    if (userVec.size === 0) return [];
+    const results: Array<[string, number]> = [];
+    for (const [candidateId, candidateVec] of this.userInteractionVectors) {
+      if (candidateId === userId) continue;
+      const sim = cosine(userVec, candidateVec);
+      if (sim >= this.minNeighbourSimilarity) {
+        results.push([candidateId, sim]);
+      }
     }
-
-    return results.sort((a, b) => b.similarity - a.similarity);
+    results.sort((a, b) => b[1] - a[1]);
+    return results.slice(0, this.neighbourPoolSize);
   }
+}
 
-  // -------------------------------------------------------------------------
-  // Private helpers
-  // -------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Summary helpers — useful when exposing the feed to clients
+// ---------------------------------------------------------------------------
 
-  private buildReason(
-    contentScore: number,
-    collabScore: number,
-    decay: number,
-    alreadySeen: boolean,
-  ): string {
-    const parts: string[] = [];
-    if (alreadySeen) parts.push('revisit');
-    if (contentScore > 0.3) parts.push('matches your interests');
-    else if (contentScore > 0.1) parts.push('partially matches your topics');
-    if (collabScore > 0.5) parts.push('highly popular with similar users');
-    else if (collabScore > 0.2) parts.push('trending with similar users');
-    if (decay < 0.3) parts.push('older content');
-    else if (decay > 0.8) parts.push('very recent');
-    return parts.length > 0 ? parts.join('; ') : 'general recommendation';
-  }
+export function summariseRanking(result: FeedRankResult, limit = 5): string {
+  const top = result.ranked.slice(0, limit);
+  if (top.length === 0) return 'No content ranked for this user.';
+  const parts = top.map((r, i) => {
+    const tags = r.reasons.length > 0 ? ` [${r.reasons.join(' · ')}]` : '';
+    return `${i + 1}. ${r.broadcast.id} score=${r.score}${tags}`;
+  });
+  return parts.join('\n');
 }
 
 export default PersonalizedFeedAI;

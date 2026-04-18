@@ -1,513 +1,508 @@
 /**
- * PreRenderEngine
+ * PreRenderEngine — Service-Worker-Aware Feed Pre-Renderer
  *
- * Pre-fetches and caches the top-20 predicted feed items for each user so
- * that content is available instantly on app open — zero loading screens.
+ * The PreRenderEngine sits between the trend pipeline and the client
+ * application.  Given a live stream of {@link BroadcastRecord} data, the
+ * engine:
  *
- * Architecture:
- *  - In-process LRU-style cache stores up to `maxCachedUsersCount` user
- *    entries (default 500).
- *  - Each entry contains up to `preRenderCount` pre-rendered card payloads
- *    (default 20) and a staleness TTL.
- *  - A "pre-render" step serialises the first `preRenderFirstN` cards
- *    (default 5) into static HTML/JSON snapshots suitable for injection into
- *    a Service Worker cache.
- *  - The engine exposes a `ServiceWorkerBridge` interface so the browser-side
- *    SW can hydrate from these snapshots without a network round-trip.
- *  - Stale cache entries are automatically invalidated when the prediction
- *    diverges from cached content by more than `divergenceThreshold`.
+ *   1. Ranks candidates per-user via {@link PersonalizedFeedAI}.
+ *   2. Uses {@link TrendPredictor} to blend in trending topics even for
+ *      brand-new users where the personal signal is sparse (cold start).
+ *   3. Serialises the resulting pre-rendered feed payload.
+ *   4. Pushes it into the browser's Cache API via a dispatcher abstraction
+ *      (the abstraction lets us unit-test without `window`).
+ *   5. Detects when the server-side fresh feed has diverged from what was
+ *      pre-cached — in which case the cache is invalidated on the next
+ *      refresh cycle.
+ *
+ * The pre-render cadence defaults to the same 30-minute interval used by
+ * {@link TrendPredictor}, but is independently configurable.
  */
 
 import logger from '../lib/logger';
-import type { RankedItem, BroadcastItem } from './PersonalizedFeedAI';
+import type { BroadcastRecord } from './TrendPredictor';
+import type {
+  FeedRankResult,
+  PersonalizedFeedAI,
+  RankedBroadcast,
+} from './PersonalizedFeedAI';
+import type { TrendPredictor, TrendPredictionSet } from './TrendPredictor';
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
+/** Lightweight broadcast card projection for pre-rendering. */
 export interface PreRenderedCard {
-  /** Broadcast ID. */
   readonly broadcastId: string;
-  /** Rank position (0-indexed). */
-  readonly rank: number;
-  /** Static HTML snapshot of the card (for SW injection). */
-  readonly htmlSnapshot: string;
-  /** JSON-serialisable data payload for hydration. */
-  readonly payload: BroadcastCardPayload;
-  /** UTC epoch ms when this card was pre-rendered. */
-  readonly renderedAt: number;
-}
-
-export interface BroadcastCardPayload {
-  readonly id: string;
-  readonly headline: string;
-  readonly description: string;
   readonly authorId: string;
-  readonly publishedAt: number;
-  readonly engagementCount: number;
+  readonly headline: string;
+  readonly body: string;
   readonly tags: readonly string[];
-  readonly relevanceScore: number;
-  readonly isFresh: boolean;
+  readonly postedAt: string;
+  readonly engagement: number;
+  readonly score: number;
+  readonly reasons: readonly string[];
+  readonly followedAuthor: boolean;
+  readonly trendIds: readonly string[];
 }
 
-export interface UserFeedCache {
+export interface PreRenderedFeed {
   readonly userId: string;
-  /** All ranked broadcast IDs (up to feedSize). */
-  readonly rankedIds: readonly string[];
-  /** Full pre-rendered card objects for the first `preRenderFirstN` items. */
-  readonly preRenderedCards: readonly PreRenderedCard[];
-  /** Raw ranked items with scores, for divergence checking. */
-  readonly rankedItems: readonly RankedItem[];
-  /** UTC epoch ms when this cache entry was created. */
-  readonly cachedAt: number;
-  /** UTC epoch ms after which this entry is considered stale. */
-  readonly expiresAt: number;
-  /** Cache hit counter — how many times this entry was served. */
-  hits: number;
+  readonly cards: readonly PreRenderedCard[];
+  readonly generatedAt: string;
+  readonly expiresAt: string;
+  /** Hash of the card ids used to detect divergence. */
+  readonly integrityHash: string;
+  /** Top trends referenced in the feed. */
+  readonly topTrends: readonly string[];
 }
 
-export interface CacheStats {
-  readonly totalUsers: number;
-  readonly totalPreRenderedCards: number;
-  readonly avgHitsPerUser: number;
-  readonly oldestEntryMs: number | null;
-  readonly newestEntryMs: number | null;
+/** Minimal contract for a cache backend (mirrors the Cache Storage API). */
+export interface CacheDispatcher {
+  put(key: string, payload: PreRenderedFeed): Promise<void>;
+  get(key: string): Promise<PreRenderedFeed | null>;
+  delete(key: string): Promise<void>;
+  keys(): Promise<readonly string[]>;
 }
 
+/** Factory primitives used by the engine (allows timer stubbing in tests). */
+export interface PreRenderSchedulerApi {
+  setInterval(fn: () => void, ms: number): { id: number };
+  clearInterval(handle: { id: number }): void;
+}
+
+export const defaultPreRenderScheduler: PreRenderSchedulerApi = {
+  setInterval(fn, ms) {
+    const id = setInterval(fn, ms) as unknown as number;
+    return { id };
+  },
+  clearInterval(handle) {
+    clearInterval(handle.id as unknown as ReturnType<typeof setInterval>);
+  },
+};
+
+/** Options for constructing the engine. */
 export interface PreRenderEngineOptions {
-  /** Injected clock. */
-  readonly now?: () => number;
-  /** TTL for cache entries in milliseconds (default: 30 minutes). */
-  readonly cacheTtlMs?: number;
-  /** Maximum number of users to cache simultaneously (default: 500). */
-  readonly maxCachedUsers?: number;
-  /** Number of feed items to cache per user (default: 20). */
-  readonly feedCacheSize?: number;
-  /** Number of cards to fully pre-render (default: 5). */
-  readonly preRenderFirstN?: number;
-  /**
-   * If the Jaccard distance between the new prediction and the cached
-   * ranked IDs exceeds this threshold, the entry is invalidated (default: 0.4).
-   */
-  readonly divergenceThreshold?: number;
+  readonly now?: () => Date;
+  /** TTL (hours) of a pre-rendered feed.  Default 1. */
+  readonly feedTtlHours?: number;
+  /** How many cards to pre-render per user.  Default 20. */
+  readonly cardsPerUser?: number;
+  /** How many leading cards to fully render.  Default 5. */
+  readonly fullyRenderedCount?: number;
+  /** How many top trends to include in cold-start feeds.  Default 5. */
+  readonly coldStartTrendCount?: number;
+  /** Cache key prefix.  Default `"quantsink/feed"`. */
+  readonly cacheKeyPrefix?: string;
 }
 
-/** Minimal interface representing a Service Worker Cache interaction. */
-export interface ServiceWorkerBridge {
-  /**
-   * Store pre-rendered cards in the SW cache under a versioned URL pattern.
-   * Returns the number of cards successfully stored.
-   */
-  store(userId: string, cards: readonly PreRenderedCard[]): Promise<number>;
-  /**
-   * Retrieve cached cards for a user from the SW cache.
-   * Returns null if no cache entry exists.
-   */
-  retrieve(userId: string): Promise<readonly PreRenderedCard[] | null>;
-  /**
-   * Invalidate all cached entries for a user.
-   */
-  invalidate(userId: string): Promise<void>;
+/** Options accepted by {@link PreRenderEngine#preRenderForUsers}. */
+export interface PreRenderBatchOptions {
+  /** Override cards per user for this batch. */
+  readonly cardsPerUser?: number;
 }
 
 // ---------------------------------------------------------------------------
-// HTML snapshot generator
+// In-memory cache dispatcher (useful in tests and for server-side reuse)
 // ---------------------------------------------------------------------------
 
-/**
- * Produce a minimal, self-contained HTML card string that can be injected
- * into the DOM before React hydration.
- *
- * The markup is intentionally lightweight — it provides visual structure for
- * instant paint while the full React component hydrates in the background.
- */
-function generateHtmlSnapshot(payload: BroadcastCardPayload, rank: number): string {
-  const tagsHtml = payload.tags
-    .map((t) => `<span class="qs-tag">${escapeHtml(t)}</span>`)
-    .join('');
+export class InMemoryCacheDispatcher implements CacheDispatcher {
+  private readonly store = new Map<string, PreRenderedFeed>();
 
-  const freshBadge = payload.isFresh
-    ? '<span class="qs-fresh-badge" aria-label="Fresh content">FRESH</span>'
-    : '<span class="qs-cached-badge" aria-label="Pre-cached content">PRE-CACHED</span>';
-
-  return `<article
-  class="qs-broadcast-card qs-pre-rendered"
-  data-broadcast-id="${escapeAttr(payload.id)}"
-  data-rank="${rank}"
-  data-rendered-at="${payload.publishedAt}"
-  aria-label="Broadcast by author ${escapeAttr(payload.authorId)}"
->
-  <header class="qs-card-header">
-    ${freshBadge}
-    <h2 class="qs-headline">${escapeHtml(payload.headline)}</h2>
-  </header>
-  <p class="qs-description">${escapeHtml(payload.description)}</p>
-  <footer class="qs-card-footer">
-    <div class="qs-tags">${tagsHtml}</div>
-    <span class="qs-engagement">${payload.engagementCount.toLocaleString()}</span>
-    <span class="qs-relevance">${payload.relevanceScore}%</span>
-  </footer>
-</article>`.trim();
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function escapeAttr(s: string): string {
-  return s.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// ---------------------------------------------------------------------------
-// Divergence check
-// ---------------------------------------------------------------------------
-
-/**
- * Jaccard distance between two ordered lists of broadcast IDs.
- * Uses set semantics — order is ignored for the distance calculation.
- * Returns a value in [0, 1] where 0 = identical, 1 = no overlap.
- */
-function jaccardDistance(a: readonly string[], b: readonly string[]): number {
-  const setA = new Set(a);
-  const setB = new Set(b);
-  let intersection = 0;
-  for (const id of setA) {
-    if (setB.has(id)) intersection++;
+  async put(key: string, payload: PreRenderedFeed): Promise<void> {
+    this.store.set(key, payload);
   }
-  const union = setA.size + setB.size - intersection;
-  return union === 0 ? 0 : 1 - intersection / union;
+
+  async get(key: string): Promise<PreRenderedFeed | null> {
+    return this.store.get(key) ?? null;
+  }
+
+  async delete(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+
+  async keys(): Promise<readonly string[]> {
+    return Array.from(this.store.keys());
+  }
+
+  size(): number {
+    return this.store.size;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// LRU eviction helper
+// Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Return the userId with the fewest hits (evict least-used entry). */
-function lruEvictTarget(cache: Map<string, UserFeedCache>): string {
-  let minHits = Infinity;
-  let candidate = '';
-  for (const [uid, entry] of cache) {
-    if (entry.hits < minHits) {
-      minHits = entry.hits;
-      candidate = uid;
+function fnv1aHash(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function headlineFromBody(body: string, maxLen = 92): string {
+  const clean = body.trim().replace(/\s+/g, ' ');
+  if (clean.length <= maxLen) return clean;
+  const slice = clean.slice(0, maxLen);
+  const lastSpace = slice.lastIndexOf(' ');
+  const cut = lastSpace > 40 ? lastSpace : maxLen;
+  return `${clean.slice(0, cut)}…`;
+}
+
+function bodyExcerpt(body: string, maxLen = 280): string {
+  const clean = body.trim().replace(/\s+/g, ' ');
+  if (clean.length <= maxLen) return clean;
+  return `${clean.slice(0, maxLen - 1)}…`;
+}
+
+function coldStartScore(
+  broadcast: BroadcastRecord,
+  trends: TrendPredictionSet,
+  nowMs: number,
+): { score: number; trendIds: string[]; reasons: string[] } {
+  const trendIds: string[] = [];
+  const reasons: string[] = [];
+  const text = broadcast.text.toLowerCase();
+  const tagSet = new Set((broadcast.tags ?? []).map((t) => t.toLowerCase()));
+  let score = 0;
+  for (const trend of trends.predictions) {
+    const termHits =
+      (text.includes(trend.term) ? 1 : 0) +
+      (tagSet.has(trend.term) ? 1.2 : 0) +
+      trend.relatedTerms.filter((r) => text.includes(r)).length * 0.3;
+    if (termHits > 0) {
+      score += termHits * trend.score;
+      trendIds.push(trend.id);
+      if (trend.rising) {
+        reasons.push(`Rising topic: ${trend.term}`);
+      }
     }
   }
-  return candidate;
+  const ageHours = Math.max(
+    0,
+    (nowMs - new Date(broadcast.postedAt).getTime()) / 3_600_000,
+  );
+  const recency = Math.pow(0.5, ageHours / 6);
+  return {
+    score: score * (0.7 + 0.3 * recency),
+    trendIds,
+    reasons,
+  };
+}
+
+function projectCard(
+  ranked: RankedBroadcast,
+  trends: TrendPredictionSet,
+): PreRenderedCard {
+  const broadcast = ranked.broadcast;
+  const loweredText = broadcast.text.toLowerCase();
+  const trendIds: string[] = [];
+  for (const trend of trends.predictions) {
+    if (loweredText.includes(trend.term)) {
+      trendIds.push(trend.id);
+    }
+  }
+  return {
+    broadcastId: broadcast.id,
+    authorId: broadcast.authorId,
+    headline: headlineFromBody(broadcast.text),
+    body: bodyExcerpt(broadcast.text),
+    tags: [...(broadcast.tags ?? [])],
+    postedAt: new Date(broadcast.postedAt).toISOString(),
+    engagement: broadcast.engagement,
+    score: ranked.score,
+    reasons: ranked.reasons,
+    followedAuthor: ranked.followedAuthor,
+    trendIds,
+  };
+}
+
+function projectColdStartCard(
+  broadcast: BroadcastRecord,
+  scoredEntry: { score: number; trendIds: string[]; reasons: string[] },
+): PreRenderedCard {
+  return {
+    broadcastId: broadcast.id,
+    authorId: broadcast.authorId,
+    headline: headlineFromBody(broadcast.text),
+    body: bodyExcerpt(broadcast.text),
+    tags: [...(broadcast.tags ?? [])],
+    postedAt: new Date(broadcast.postedAt).toISOString(),
+    engagement: broadcast.engagement,
+    score: Math.round(scoredEntry.score * 10_000) / 10_000,
+    reasons:
+      scoredEntry.reasons.length > 0
+        ? scoredEntry.reasons
+        : ['Trending right now'],
+    followedAuthor: false,
+    trendIds: scoredEntry.trendIds,
+  };
+}
+
+function hashCards(cards: readonly PreRenderedCard[]): string {
+  return fnv1aHash(cards.map((c) => `${c.broadcastId}:${c.score}`).join('|'));
 }
 
 // ---------------------------------------------------------------------------
-// PreRenderEngine
+// PreRenderEngine — the main orchestrator
 // ---------------------------------------------------------------------------
 
 export class PreRenderEngine {
-  private readonly now: () => number;
-  private readonly cacheTtlMs: number;
-  private readonly maxCachedUsers: number;
-  private readonly feedCacheSize: number;
-  private readonly preRenderFirstN: number;
-  private readonly divergenceThreshold: number;
+  private readonly now: () => Date;
+  private readonly feedTtlHours: number;
+  private readonly cardsPerUser: number;
+  private readonly fullyRenderedCount: number;
+  private readonly coldStartTrendCount: number;
+  private readonly cacheKeyPrefix: string;
 
-  private readonly cache = new Map<string, UserFeedCache>();
-
-  constructor(options: PreRenderEngineOptions = {}) {
-    this.now = options.now ?? (() => Date.now());
-    this.cacheTtlMs = options.cacheTtlMs ?? 30 * 60 * 1_000;
-    this.maxCachedUsers = options.maxCachedUsers ?? 500;
-    this.feedCacheSize = options.feedCacheSize ?? 20;
-    this.preRenderFirstN = options.preRenderFirstN ?? 5;
-    this.divergenceThreshold = options.divergenceThreshold ?? 0.4;
+  constructor(
+    private readonly feedAi: PersonalizedFeedAI,
+    private readonly trendPredictor: TrendPredictor,
+    private readonly cache: CacheDispatcher,
+    options: PreRenderEngineOptions = {},
+  ) {
+    this.now = options.now ?? (() => new Date());
+    this.feedTtlHours = options.feedTtlHours ?? 1;
+    this.cardsPerUser = options.cardsPerUser ?? 20;
+    this.fullyRenderedCount = options.fullyRenderedCount ?? 5;
+    this.coldStartTrendCount = options.coldStartTrendCount ?? 5;
+    this.cacheKeyPrefix = options.cacheKeyPrefix ?? 'quantsink/feed';
   }
 
-  // -------------------------------------------------------------------------
-  // Cache population
-  // -------------------------------------------------------------------------
+  /** Build a deterministic cache key for a user. */
+  keyFor(userId: string): string {
+    return `${this.cacheKeyPrefix}/${userId}`;
+  }
 
   /**
-   * Pre-render and cache the feed for a user.
-   *
-   * @param userId         Target user.
-   * @param rankedItems    Output from PersonalizedFeedAI.rankFeed().
-   * @param broadcastMap   Lookup map from broadcast ID → BroadcastItem.
-   * @param swBridge       Optional Service Worker bridge for offline support.
-   * @returns The populated UserFeedCache entry.
+   * Produce a pre-rendered feed for a single user without touching the
+   * cache.  Useful for server-side rendering.
    */
-  async preCacheFeed(
+  buildFeed(
     userId: string,
-    rankedItems: readonly RankedItem[],
-    broadcastMap: Map<string, BroadcastItem>,
-    swBridge?: ServiceWorkerBridge,
-  ): Promise<UserFeedCache> {
-    const nowMs = this.now();
+    candidates: readonly BroadcastRecord[],
+    options: { cardsPerUser?: number } = {},
+  ): PreRenderedFeed {
+    const nowDate = this.now();
+    const nowMs = nowDate.getTime();
+    const cardLimit = options.cardsPerUser ?? this.cardsPerUser;
 
-    // Evict stale entries and enforce max cache size
-    this.evictStaleEntries();
-    if (this.cache.size >= this.maxCachedUsers && !this.cache.has(userId)) {
-      const evictTarget = lruEvictTarget(this.cache);
-      if (evictTarget) this.cache.delete(evictTarget);
-    }
+    const trends =
+      this.trendPredictor.getLastPrediction() ??
+      this.trendPredictor.predict(candidates);
 
-    const capped = rankedItems.slice(0, this.feedCacheSize);
-    const rankedIds = capped.map((r) => r.broadcastId);
+    const profile = this.feedAi.getProfile(userId);
 
-    // Build pre-rendered cards for first N items
-    const preRenderedCards: PreRenderedCard[] = [];
-    for (let i = 0; i < Math.min(this.preRenderFirstN, capped.length); i++) {
-      const item = capped[i];
-      const broadcast = broadcastMap.get(item.broadcastId);
-      if (!broadcast) continue;
+    let cards: PreRenderedCard[];
 
-      const ageFactor = (nowMs - broadcast.publishedAt) / (60 * 60 * 1_000);
-      const isFresh = ageFactor < 1; // fresh if < 1 hour old
+    if (!profile || profile.interactionCount === 0) {
+      // Cold start: rank purely on trend match + recency.
+      const scored = candidates
+        .map((broadcast) => ({
+          broadcast,
+          scored: coldStartScore(broadcast, trends, nowMs),
+        }))
+        .sort((a, b) => b.scored.score - a.scored.score)
+        .slice(0, cardLimit);
 
-      const payload: BroadcastCardPayload = {
-        id: broadcast.id,
-        headline: this.extractHeadline(broadcast.content),
-        description: this.extractDescription(broadcast.content),
-        authorId: broadcast.authorId,
-        publishedAt: broadcast.publishedAt,
-        engagementCount: broadcast.engagementCount,
-        tags: broadcast.tags ?? [],
-        relevanceScore: Math.round(item.contentScore * 100),
-        isFresh,
-      };
-
-      const htmlSnapshot = generateHtmlSnapshot(payload, i);
-
-      preRenderedCards.push({
-        broadcastId: item.broadcastId,
-        rank: i,
-        htmlSnapshot,
-        payload,
-        renderedAt: nowMs,
+      cards = scored.map((entry) =>
+        projectColdStartCard(entry.broadcast, entry.scored),
+      );
+    } else {
+      const ranked: FeedRankResult = this.feedAi.rank(userId, candidates, {
+        topK: cardLimit,
       });
+      cards = ranked.ranked.map((r) => projectCard(r, trends));
     }
 
-    const entry: UserFeedCache = {
+    const integrityHash = hashCards(cards);
+    const topTrends = trends.predictions
+      .slice(0, this.coldStartTrendCount)
+      .map((t) => t.term);
+
+    const feed: PreRenderedFeed = {
       userId,
-      rankedIds,
-      preRenderedCards,
-      rankedItems: capped,
-      cachedAt: nowMs,
-      expiresAt: nowMs + this.cacheTtlMs,
-      hits: 0,
+      cards,
+      generatedAt: nowDate.toISOString(),
+      expiresAt: new Date(
+        nowMs + this.feedTtlHours * 3_600_000,
+      ).toISOString(),
+      integrityHash,
+      topTrends,
     };
 
-    this.cache.set(userId, entry);
-
-    // Push to Service Worker cache for offline support
-    if (swBridge && preRenderedCards.length > 0) {
-      try {
-        const stored = await swBridge.store(userId, preRenderedCards);
-        logger.debug({ userId, stored }, 'PreRenderEngine pushed to SW cache');
-      } catch (err) {
-        logger.warn({ userId, err }, 'PreRenderEngine SW cache push failed — continuing in-process');
-      }
-    }
-
-    logger.info(
-      { userId, rankedCount: capped.length, preRenderedCount: preRenderedCards.length },
-      'PreRenderEngine feed pre-cached',
+    logger.debug(
+      {
+        userId,
+        cardCount: cards.length,
+        integrityHash,
+        coldStart: !profile || profile.interactionCount === 0,
+      },
+      'PreRenderEngine built feed',
     );
 
-    return entry;
+    return feed;
   }
 
-  // -------------------------------------------------------------------------
-  // Cache retrieval
-  // -------------------------------------------------------------------------
-
   /**
-   * Retrieve a user's cached feed.
-   * Returns null if no entry exists or the entry has expired.
-   * Increments the hit counter on success.
+   * Build AND persist a pre-rendered feed to the cache dispatcher, ready
+   * for instant service-worker delivery on next app open.
    */
-  getCachedFeed(userId: string): UserFeedCache | null {
-    const entry = this.cache.get(userId);
-    if (!entry) return null;
-    if (this.now() > entry.expiresAt) {
-      this.cache.delete(userId);
-      logger.debug({ userId }, 'PreRenderEngine cache entry expired on retrieval');
+  async preRenderForUser(
+    userId: string,
+    candidates: readonly BroadcastRecord[],
+    options: { cardsPerUser?: number } = {},
+  ): Promise<PreRenderedFeed> {
+    const feed = this.buildFeed(userId, candidates, options);
+    await this.cache.put(this.keyFor(userId), feed);
+    return feed;
+  }
+
+  /** Pre-render for an explicit list of users. */
+  async preRenderForUsers(
+    userIds: readonly string[],
+    candidates: readonly BroadcastRecord[],
+    options: PreRenderBatchOptions = {},
+  ): Promise<PreRenderedFeed[]> {
+    const feeds: PreRenderedFeed[] = [];
+    for (const userId of userIds) {
+      const feed = await this.preRenderForUser(userId, candidates, {
+        cardsPerUser: options.cardsPerUser,
+      });
+      feeds.push(feed);
+    }
+    return feeds;
+  }
+
+  /** Retrieve a previously-cached feed, respecting TTL. */
+  async readCached(userId: string): Promise<PreRenderedFeed | null> {
+    const cached = await this.cache.get(this.keyFor(userId));
+    if (!cached) return null;
+    const expiry = new Date(cached.expiresAt).getTime();
+    if (Number.isFinite(expiry) && expiry < this.now().getTime()) {
+      await this.cache.delete(this.keyFor(userId));
       return null;
     }
-    entry.hits++;
-    return entry;
+    return cached;
   }
 
   /**
-   * Attempt to retrieve from SW cache if in-process cache misses.
-   * Falls back gracefully if the bridge is unavailable.
+   * Compare a cached feed against a freshly built one.  Returns a divergence
+   * score in [0,1] — 0 means perfectly aligned, 1 means totally different.
    */
-  async getCachedFeedWithSWFallback(
+  divergence(cached: PreRenderedFeed, fresh: PreRenderedFeed): number {
+    if (cached.cards.length === 0 && fresh.cards.length === 0) return 0;
+    const cachedIds = new Set(cached.cards.map((c) => c.broadcastId));
+    const freshIds = new Set(fresh.cards.map((c) => c.broadcastId));
+    let intersection = 0;
+    for (const id of cachedIds) {
+      if (freshIds.has(id)) intersection += 1;
+    }
+    const union = new Set<string>([...cachedIds, ...freshIds]).size;
+    if (union === 0) return 0;
+    return 1 - intersection / union;
+  }
+
+  /**
+   * Invalidate a user's feed if the freshly computed version has diverged
+   * materially from the cached one.  Returns the action taken.
+   */
+  async refreshIfDiverged(
     userId: string,
-    swBridge?: ServiceWorkerBridge,
-  ): Promise<UserFeedCache | readonly PreRenderedCard[] | null> {
-    const inProcess = this.getCachedFeed(userId);
-    if (inProcess) return inProcess;
+    candidates: readonly BroadcastRecord[],
+    threshold = 0.35,
+  ): Promise<{ action: 'kept' | 'refreshed' | 'missing'; divergence: number }> {
+    const cached = await this.readCached(userId);
+    if (!cached) {
+      await this.preRenderForUser(userId, candidates);
+      return { action: 'missing', divergence: 1 };
+    }
+    const fresh = this.buildFeed(userId, candidates);
+    const div = this.divergence(cached, fresh);
+    if (div >= threshold) {
+      await this.cache.put(this.keyFor(userId), fresh);
+      return { action: 'refreshed', divergence: div };
+    }
+    return { action: 'kept', divergence: div };
+  }
 
-    if (!swBridge) return null;
+  /** Drop every cached feed (e.g. on global model updates). */
+  async purgeAll(): Promise<number> {
+    const keys = await this.cache.keys();
+    let removed = 0;
+    for (const key of keys) {
+      if (key.startsWith(this.cacheKeyPrefix)) {
+        await this.cache.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
 
+  /** Number of cards that should be fully rendered by the client. */
+  get fullRenderLimit(): number {
+    return this.fullyRenderedCount;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-refresh scheduler
+// ---------------------------------------------------------------------------
+
+export interface PreRenderScheduleOptions {
+  /** Refresh cadence in minutes. Default 30. */
+  readonly refreshEveryMinutes?: number;
+  /** Scheduler (test-injectable). */
+  readonly scheduler?: PreRenderSchedulerApi;
+  /** Function that returns the users for which to pre-render. */
+  readonly getUserIds: () => Promise<readonly string[]> | readonly string[];
+  /** Function that returns the current candidate corpus. */
+  readonly getCandidates: () =>
+    | Promise<readonly BroadcastRecord[]>
+    | readonly BroadcastRecord[];
+  /** Called on every completed refresh cycle. */
+  readonly onCycle?: (feeds: readonly PreRenderedFeed[]) => void;
+  /** Called when a refresh cycle throws. */
+  readonly onError?: (err: unknown) => void;
+}
+
+export function startPreRenderSchedule(
+  engine: PreRenderEngine,
+  options: PreRenderScheduleOptions,
+): () => void {
+  const scheduler = options.scheduler ?? defaultPreRenderScheduler;
+  const intervalMs = (options.refreshEveryMinutes ?? 30) * 60_000;
+  let disposed = false;
+
+  const tick = async (): Promise<void> => {
+    if (disposed) return;
     try {
-      const swCards = await swBridge.retrieve(userId);
-      if (swCards && swCards.length > 0) {
-        logger.debug({ userId, cardCount: swCards.length }, 'PreRenderEngine SW cache hit');
-        return swCards;
-      }
+      const [userIds, candidates] = await Promise.all([
+        Promise.resolve(options.getUserIds()),
+        Promise.resolve(options.getCandidates()),
+      ]);
+      const feeds = await engine.preRenderForUsers(userIds, candidates);
+      options.onCycle?.(feeds);
     } catch (err) {
-      logger.warn({ userId, err }, 'PreRenderEngine SW cache retrieve failed');
+      options.onError?.(err);
+      logger.warn({ err }, 'PreRenderEngine schedule tick failed');
     }
+  };
 
-    return null;
-  }
+  void tick();
+  const handle = scheduler.setInterval(() => {
+    void tick();
+  }, intervalMs);
 
-  // -------------------------------------------------------------------------
-  // Invalidation
-  // -------------------------------------------------------------------------
-
-  /**
-   * Invalidate the cache entry for a user if the new ranked IDs diverge
-   * from the cached IDs beyond the configured threshold.
-   *
-   * @returns true if the entry was invalidated, false if it was kept.
-   */
-  async invalidateIfDiverged(
-    userId: string,
-    newRankedIds: readonly string[],
-    swBridge?: ServiceWorkerBridge,
-  ): Promise<boolean> {
-    const entry = this.cache.get(userId);
-    if (!entry) return false;
-
-    const distance = jaccardDistance(entry.rankedIds, newRankedIds);
-    if (distance > this.divergenceThreshold) {
-      this.cache.delete(userId);
-      if (swBridge) {
-        try {
-          await swBridge.invalidate(userId);
-        } catch (err) {
-          logger.warn({ userId, err }, 'PreRenderEngine SW invalidation failed');
-        }
-      }
-      logger.info({ userId, distance }, 'PreRenderEngine cache invalidated due to divergence');
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * Unconditionally remove a user's cache entry.
-   */
-  async invalidateUser(userId: string, swBridge?: ServiceWorkerBridge): Promise<void> {
-    this.cache.delete(userId);
-    if (swBridge) {
-      try {
-        await swBridge.invalidate(userId);
-      } catch (err) {
-        logger.warn({ userId, err }, 'PreRenderEngine SW force-invalidation failed');
-      }
-    }
-  }
-
-  /**
-   * Evict all entries that have passed their TTL.
-   * Called automatically on each `preCacheFeed` invocation.
-   */
-  evictStaleEntries(): void {
-    const nowMs = this.now();
-    let evicted = 0;
-    for (const [uid, entry] of this.cache) {
-      if (nowMs > entry.expiresAt) {
-        this.cache.delete(uid);
-        evicted++;
-      }
-    }
-    if (evicted > 0) {
-      logger.debug({ evicted }, 'PreRenderEngine stale entries evicted');
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Statistics
-  // -------------------------------------------------------------------------
-
-  /**
-   * Return aggregate statistics about the current cache state.
-   */
-  getStats(): CacheStats {
-    let totalCards = 0;
-    let totalHits = 0;
-    let oldest: number | null = null;
-    let newest: number | null = null;
-
-    for (const entry of this.cache.values()) {
-      totalCards += entry.preRenderedCards.length;
-      totalHits += entry.hits;
-      if (oldest === null || entry.cachedAt < oldest) oldest = entry.cachedAt;
-      if (newest === null || entry.cachedAt > newest) newest = entry.cachedAt;
-    }
-
-    return {
-      totalUsers: this.cache.size,
-      totalPreRenderedCards: totalCards,
-      avgHitsPerUser: this.cache.size > 0 ? totalHits / this.cache.size : 0,
-      oldestEntryMs: oldest,
-      newestEntryMs: newest,
-    };
-  }
-
-  /**
-   * Return the number of users currently in the cache.
-   */
-  getCachedUserCount(): number {
-    return this.cache.size;
-  }
-
-  /**
-   * Check whether a valid (non-expired) cache entry exists for a user.
-   */
-  hasCachedFeed(userId: string): boolean {
-    const entry = this.cache.get(userId);
-    if (!entry) return false;
-    return this.now() <= entry.expiresAt;
-  }
-
-  /**
-   * Flush the entire cache. Useful for testing or forced global refresh.
-   */
-  flush(): void {
-    const count = this.cache.size;
-    this.cache.clear();
-    logger.info({ count }, 'PreRenderEngine cache flushed');
-  }
-
-  // -------------------------------------------------------------------------
-  // Content extraction helpers
-  // -------------------------------------------------------------------------
-
-  /**
-   * Extract a headline from broadcast content.
-   * Uses the first sentence (up to 120 characters) as the headline.
-   */
-  private extractHeadline(content: string): string {
-    const first = content.split(/[.!?\n]/)[0]?.trim() ?? content;
-    return first.length > 120 ? first.slice(0, 117) + '…' : first;
-  }
-
-  /**
-   * Extract a short description from broadcast content.
-   * Uses content after the first sentence, up to 280 characters.
-   */
-  private extractDescription(content: string): string {
-    const parts = content.split(/[.!?\n]/);
-    const body = parts.slice(1).join('. ').trim();
-    if (!body) return content.slice(0, 280);
-    return body.length > 280 ? body.slice(0, 277) + '…' : body;
-  }
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    scheduler.clearInterval(handle);
+  };
 }
 
 export default PreRenderEngine;

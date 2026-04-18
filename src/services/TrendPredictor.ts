@@ -1,13 +1,22 @@
 /**
- * TrendPredictor
+ * TrendPredictor — Predictive Trend Analysis Engine
  *
- * Analyses the last 24 hours of broadcast topics using TF-IDF scoring
- * combined with temporal weighting to surface rising trends.  The predictor
- * identifies topics with accelerating engagement velocity and returns the top
- * 10 most likely trending topics for the next 6-hour prediction window.
+ * Analyses the last 24 hours of broadcast topics using a weighted TF-IDF
+ * scheme combined with temporal decay so that very recent topics count
+ * proportionally more than topics from the far end of the analysis window.
  *
- * Predictions are refreshed automatically every 30 minutes when the scheduler
- * is started via `startScheduler()`.
+ * The predictor identifies "rising" trends by measuring engagement velocity
+ * across successive time windows — a topic whose engagement per unit time
+ * has accelerated meaningfully (second derivative > 0) is flagged as rising.
+ *
+ * Finally, it projects a ranked list of topics that are most likely to
+ * dominate the next six-hour broadcast window.  Predictions are cached and
+ * regenerated every thirty minutes by the consuming layer (see
+ * PreRenderEngine).
+ *
+ * The service is fully deterministic — all time / random primitives are
+ * injectable — which lets us unit-test the pipeline end-to-end without
+ * timing flakiness.
  */
 
 import logger from '../lib/logger';
@@ -16,406 +25,555 @@ import logger from '../lib/logger';
 // Public types
 // ---------------------------------------------------------------------------
 
-export interface BroadcastDocument {
-  /** Unique broadcast identifier. */
+/** A single broadcast record that feeds the trend pipeline. */
+export interface BroadcastRecord {
+  /** Broadcast identifier (unique). */
   readonly id: string;
-  /** Raw text content of the broadcast. */
-  readonly content: string;
-  /** UTC epoch ms when the broadcast was published. */
-  readonly publishedAt: number;
-  /** Cumulative engagement count at the time of ingestion. */
-  readonly engagementCount: number;
-  /** Optional engagement delta since previous sample (for velocity calc). */
-  readonly engagementDelta?: number;
+  /** Author user identifier. */
+  readonly authorId: string;
+  /** Raw textual body of the broadcast. */
+  readonly text: string;
+  /** ISO timestamp or Date for when the broadcast was posted. */
+  readonly postedAt: Date;
+  /** Explicit engagement signal — likes + replies + reshares. */
+  readonly engagement: number;
+  /** Optional explicit topic labels from moderators / creators. */
+  readonly tags?: readonly string[];
 }
 
-export interface TrendScore {
-  /** The topic / term that is trending. */
-  readonly topic: string;
-  /** Composite trend score (0-∞, higher = stronger trend). */
+/** Token and its weight inside the trend model. */
+export interface TrendTerm {
+  /** Canonicalised lowercase term. */
+  readonly term: string;
+  /** TF-IDF weighted score, 0..∞. */
   readonly score: number;
-  /** Raw TF-IDF contribution to the score. */
-  readonly tfidfScore: number;
-  /** Temporal weighting factor applied (0-1, recent = 1). */
-  readonly temporalWeight: number;
-  /** Engagement velocity: delta engagement / time elapsed (normalised). */
-  readonly velocity: number;
-  /** Number of documents the topic appeared in. */
+  /** Raw document frequency in the window. */
   readonly documentFrequency: number;
+  /** Sum of engagement across documents containing the term. */
+  readonly engagement: number;
 }
 
-export interface PredictionWindow {
-  /** ISO timestamp when the prediction was generated. */
+/** A single trend prediction. */
+export interface TrendPrediction {
+  /** Stable identifier for the trend. */
+  readonly id: string;
+  /** Primary term that names the trend. */
+  readonly term: string;
+  /** Supporting related terms (bi-grams / co-occurring). */
+  readonly relatedTerms: readonly string[];
+  /** Final ranking score (higher = more likely to dominate). */
+  readonly score: number;
+  /** Velocity of engagement growth (delta / window). */
+  readonly velocity: number;
+  /** Acceleration — second derivative. Positive = rising trend. */
+  readonly acceleration: number;
+  /** Whether the trend is classified as rising (accelerating). */
+  readonly rising: boolean;
+  /** Sample broadcast ids contributing to this trend. */
+  readonly supportingBroadcastIds: readonly string[];
+  /** ISO timestamp the prediction was produced at. */
+  readonly predictedAt: string;
+}
+
+/** Top-level prediction envelope. */
+export interface TrendPredictionSet {
+  /** Rolling window used to generate the predictions (hours). */
+  readonly analysisWindowHours: number;
+  /** Forecast horizon (hours). */
+  readonly forecastHorizonHours: number;
+  /** ISO timestamp of the end of the analysis window. */
   readonly generatedAt: string;
-  /** Prediction covers broadcasts in this time range (epoch ms). */
-  readonly windowStart: number;
-  readonly windowEnd: number;
-  /** Top-10 predicted trending topics for the next 6-hour window. */
-  readonly topTopics: readonly TrendScore[];
-  /** Total documents analysed. */
-  readonly documentCount: number;
+  /** Predictions sorted by score descending. */
+  readonly predictions: readonly TrendPrediction[];
+  /** Total broadcasts analysed. */
+  readonly sampleSize: number;
+  /** Total unique terms observed (post-filter). */
+  readonly vocabularySize: number;
 }
 
+/** Options for instantiating the TrendPredictor. */
 export interface TrendPredictorOptions {
-  /** Injected clock – useful for deterministic unit tests. */
-  readonly now?: () => number;
-  /** Analysis window in milliseconds (default: 24 hours). */
-  readonly analysisWindowMs?: number;
-  /** Prediction horizon in milliseconds (default: 6 hours). */
-  readonly predictionHorizonMs?: number;
-  /** Refresh interval in milliseconds (default: 30 minutes). */
-  readonly refreshIntervalMs?: number;
-  /** How many top topics to return (default: 10). */
-  readonly topN?: number;
-  /** Minimum document frequency to be considered a trend (default: 2). */
-  readonly minDocFrequency?: number;
+  /** Injected clock for deterministic tests. */
+  readonly now?: () => Date;
+  /** How many hours of history to analyse.  Default 24. */
+  readonly analysisWindowHours?: number;
+  /** How many hours into the future we are projecting.  Default 6. */
+  readonly forecastHorizonHours?: number;
+  /** Number of top predictions to return.  Default 10. */
+  readonly topK?: number;
+  /** Minimum document frequency for a term to qualify.  Default 2. */
+  readonly minDocumentFrequency?: number;
+  /** Whether to include bi-grams.  Default true. */
+  readonly includeBigrams?: boolean;
+  /** Number of equally-sized sub-windows used for velocity. Default 6. */
+  readonly velocityBuckets?: number;
+  /** Temporal half-life in hours for recency weighting. Default 4. */
+  readonly temporalHalfLifeHours?: number;
 }
 
 // ---------------------------------------------------------------------------
-// Stop-word list — excluded from TF-IDF to reduce noise
+// Stopword list — intentionally compact to keep signal words
 // ---------------------------------------------------------------------------
 
-const STOP_WORDS = new Set([
-  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-  'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'is', 'are',
-  'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does',
-  'did', 'will', 'would', 'shall', 'should', 'may', 'might', 'can', 'could',
-  'this', 'that', 'these', 'those', 'it', 'its', 'we', 'you', 'he', 'she',
-  'they', 'them', 'their', 'our', 'your', 'my', 'his', 'her', 'not', 'no',
-  'so', 'if', 'as', 'i', 'me', 'us', 'all', 'more', 'also', 'just', 'than',
+const STOPWORDS: ReadonlySet<string> = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'from',
+  'has', 'have', 'had', 'he', 'her', 'hers', 'his', 'how', 'i', 'if',
+  'in', 'into', 'is', 'it', 'its', 'just', 'may', 'me', 'my', 'no', 'not',
+  'of', 'on', 'or', 'our', 'so', 'that', 'the', 'their', 'them', 'then',
+  'there', 'these', 'they', 'this', 'those', 'to', 'too', 'was', 'we',
+  'were', 'what', 'when', 'where', 'which', 'while', 'who', 'why', 'will',
+  'with', 'you', 'your', 'yours', 'am', 'been', 'being', 'did', 'do',
+  'does', 'doing', 'over', 'under', 'again', 'further', 'out', 'up',
+  'down', 'off', 'above', 'below', 'about', 'against', 'between', 'very',
 ]);
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Tokenise text into lowercase, alphabetic-only terms of length ≥ 3.
- * Numbers are stripped; punctuation is treated as whitespace.
- */
-function tokenise(text: string): string[] {
+/** Canonicalise text into a list of unigram terms. */
+export function tokenise(text: string): string[] {
+  if (!text) return [];
   return text
     .toLowerCase()
-    .replace(/[^a-z\s]/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[^a-z0-9\s#@'-]/g, ' ')
     .split(/\s+/)
-    .filter((t) => t.length >= 3 && !STOP_WORDS.has(t));
+    .map((w) => w.replace(/^[-']+|[-']+$/g, ''))
+    .filter((w) => w.length > 2 && !STOPWORDS.has(w));
 }
 
-/**
- * Compute term-frequency map for a single document.
- * Returns normalised TF (count / total words).
- */
-function computeTF(tokens: string[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const token of tokens) {
-    counts.set(token, (counts.get(token) ?? 0) + 1);
-  }
-  const total = tokens.length || 1;
-  const tf = new Map<string, number>();
-  for (const [term, count] of counts) {
-    tf.set(term, count / total);
-  }
-  return tf;
-}
-
-/**
- * Compute inverse-document-frequency for each term across all documents.
- * Uses smoothed IDF: ln((1 + N) / (1 + df)) + 1 to avoid division by zero.
- */
-function computeIDF(allTokenSets: string[][]): Map<string, number> {
-  const N = allTokenSets.length;
-  const df = new Map<string, number>();
-  for (const tokens of allTokenSets) {
-    for (const term of new Set(tokens)) {
-      df.set(term, (df.get(term) ?? 0) + 1);
+/** Produce bi-gram terms from an ordered token list. */
+export function bigrams(tokens: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length - 1; i += 1) {
+    const firstToken = tokens[i];
+    const secondToken = tokens[i + 1];
+    if (firstToken.length > 2 && secondToken.length > 2) {
+      out.push(`${firstToken} ${secondToken}`);
     }
   }
-  const idf = new Map<string, number>();
-  for (const [term, docFreq] of df) {
-    idf.set(term, Math.log((1 + N) / (1 + docFreq)) + 1);
+  return out;
+}
+
+/**
+ * Convert a date to a millisecond epoch safely.  Accepts Date, ISO string,
+ * or numeric epoch.
+ */
+function epochOf(value: Date | string | number): number {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === 'number') return value;
+  return new Date(value).getTime();
+}
+
+/** Stable hash for generating prediction ids without a crypto dependency. */
+function stableHash(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
   }
-  return idf;
+  return h.toString(16).padStart(8, '0');
 }
 
-/**
- * Exponential temporal decay weight.
- * Documents published at `nowMs` receive weight 1.0;
- * a document published `windowMs` ago receives weight ~exp(-3) ≈ 0.05.
- */
-function temporalWeight(publishedAt: number, nowMs: number, windowMs: number): number {
-  const ageMs = Math.max(0, nowMs - publishedAt);
-  const normalised = ageMs / windowMs;
-  // Decay coefficient 3 → ~5% weight at the edge of the window
-  return Math.exp(-3 * normalised);
-}
-
-/**
- * Normalise engagement delta into a velocity score in [0, 1].
- * Uses a soft-clamp via tanh so extreme outliers don't dominate.
- */
-function normaliseVelocity(delta: number, maxExpectedDelta: number): number {
-  if (maxExpectedDelta <= 0) return 0;
-  const ratio = delta / maxExpectedDelta;
-  // tanh maps ℝ → (-1, 1); we shift to [0, 1]
-  return (Math.tanh(ratio * 2) + 1) / 2;
+/** Clamp helper. */
+function clamp(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
 }
 
 // ---------------------------------------------------------------------------
-// TrendPredictor
+// Core data structures
+// ---------------------------------------------------------------------------
+
+interface TermStat {
+  term: string;
+  /** Engagement-weighted tf. */
+  termFrequency: number;
+  /** Number of distinct documents containing the term. */
+  documentFrequency: number;
+  /** Total engagement of supporting docs. */
+  engagement: number;
+  /** Broadcast ids contributing to the term. */
+  supporting: Set<string>;
+  /** Per-bucket engagement for velocity calculations. */
+  bucketEngagement: number[];
+}
+
+interface PairCooccurrence {
+  count: number;
+  engagement: number;
+}
+
+// ---------------------------------------------------------------------------
+// TrendPredictor class
 // ---------------------------------------------------------------------------
 
 export class TrendPredictor {
-  private readonly now: () => number;
-  private readonly analysisWindowMs: number;
-  private readonly predictionHorizonMs: number;
-  private readonly refreshIntervalMs: number;
-  private readonly topN: number;
-  private readonly minDocFrequency: number;
+  private readonly now: () => Date;
+  private readonly analysisWindowHours: number;
+  private readonly forecastHorizonHours: number;
+  private readonly topK: number;
+  private readonly minDocumentFrequency: number;
+  private readonly includeBigrams: boolean;
+  private readonly velocityBuckets: number;
+  private readonly temporalHalfLifeHours: number;
 
-  private documents: BroadcastDocument[] = [];
-  private lastPrediction: PredictionWindow | null = null;
-  private schedulerHandle: ReturnType<typeof setInterval> | null = null;
+  /** Last produced prediction set, kept for cheap reads. */
+  private lastPrediction: TrendPredictionSet | null = null;
 
   constructor(options: TrendPredictorOptions = {}) {
-    this.now = options.now ?? (() => Date.now());
-    this.analysisWindowMs = options.analysisWindowMs ?? 24 * 60 * 60 * 1_000; // 24 h
-    this.predictionHorizonMs = options.predictionHorizonMs ?? 6 * 60 * 60 * 1_000; // 6 h
-    this.refreshIntervalMs = options.refreshIntervalMs ?? 30 * 60 * 1_000;    // 30 min
-    this.topN = options.topN ?? 10;
-    this.minDocFrequency = options.minDocFrequency ?? 2;
-  }
+    this.now = options.now ?? (() => new Date());
+    this.analysisWindowHours = options.analysisWindowHours ?? 24;
+    this.forecastHorizonHours = options.forecastHorizonHours ?? 6;
+    this.topK = options.topK ?? 10;
+    this.minDocumentFrequency = options.minDocumentFrequency ?? 2;
+    this.includeBigrams = options.includeBigrams ?? true;
+    this.velocityBuckets = options.velocityBuckets ?? 6;
+    this.temporalHalfLifeHours = options.temporalHalfLifeHours ?? 4;
 
-  // -------------------------------------------------------------------------
-  // Document ingestion
-  // -------------------------------------------------------------------------
-
-  /**
-   * Ingest one or more broadcast documents into the analysis corpus.
-   * Documents outside the analysis window are silently ignored.
-   */
-  ingest(docs: BroadcastDocument | BroadcastDocument[]): void {
-    const incoming = Array.isArray(docs) ? docs : [docs];
-    const cutoff = this.now() - this.analysisWindowMs;
-    for (const doc of incoming) {
-      if (doc.publishedAt >= cutoff) {
-        this.documents.push(doc);
-      }
+    if (this.analysisWindowHours <= 0) {
+      throw new Error('analysisWindowHours must be positive');
     }
-    logger.debug({ ingested: incoming.length, total: this.documents.length }, 'TrendPredictor documents ingested');
-  }
-
-  /**
-   * Evict all documents older than the analysis window from the internal corpus.
-   */
-  evictStale(): void {
-    const cutoff = this.now() - this.analysisWindowMs;
-    const before = this.documents.length;
-    this.documents = this.documents.filter((d) => d.publishedAt >= cutoff);
-    const evicted = before - this.documents.length;
-    if (evicted > 0) {
-      logger.debug({ evicted }, 'TrendPredictor stale documents evicted');
+    if (this.velocityBuckets < 2) {
+      throw new Error('velocityBuckets must be at least 2 for velocity calc');
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Core analysis
-  // -------------------------------------------------------------------------
-
-  /**
-   * Run a full TF-IDF + temporal-velocity analysis pass over the current
-   * document corpus and return the top-N trending topics.
-   */
-  predict(): PredictionWindow {
-    this.evictStale();
-
-    const nowMs = this.now();
-    const docs = this.documents;
-
-    if (docs.length === 0) {
-      const empty: PredictionWindow = {
-        generatedAt: new Date(nowMs).toISOString(),
-        windowStart: nowMs,
-        windowEnd: nowMs + this.predictionHorizonMs,
-        topTopics: [],
-        documentCount: 0,
-      };
-      this.lastPrediction = empty;
-      return empty;
-    }
-
-    // 1. Tokenise every document
-    const tokenSets = docs.map((d) => tokenise(d.content));
-
-    // 2. Compute IDF across the full corpus
-    const idf = computeIDF(tokenSets);
-
-    // 3. Determine max engagement delta for velocity normalisation
-    const maxDelta = docs.reduce(
-      (m, d) => Math.max(m, d.engagementDelta ?? d.engagementCount),
-      1,
-    );
-
-    // 4. Accumulate per-term composite scores
-    //    score(term) = Σ_docs [ TF(term, doc) * IDF(term) * temporalWeight(doc) * (1 + velocity(doc)) ]
-    const termScore = new Map<string, number>();
-    const termTFIDF = new Map<string, number>();
-    const termVelocity = new Map<string, number>();
-    const termTemporal = new Map<string, number>();
-    const termDocFreq = new Map<string, number>();
-
-    for (let i = 0; i < docs.length; i++) {
-      const doc = docs[i];
-      const tokens = tokenSets[i];
-      const tf = computeTF(tokens);
-      const tWeight = temporalWeight(doc.publishedAt, nowMs, this.analysisWindowMs);
-      const delta = doc.engagementDelta ?? doc.engagementCount;
-      const vel = normaliseVelocity(delta, maxDelta);
-
-      for (const [term, tfVal] of tf) {
-        const idfVal = idf.get(term) ?? 1;
-        const tfidfContrib = tfVal * idfVal;
-        const composite = tfidfContrib * tWeight * (1 + vel);
-
-        termScore.set(term, (termScore.get(term) ?? 0) + composite);
-        termTFIDF.set(term, (termTFIDF.get(term) ?? 0) + tfidfContrib);
-        termVelocity.set(term, Math.max(termVelocity.get(term) ?? 0, vel));
-        termTemporal.set(term, Math.max(termTemporal.get(term) ?? 0, tWeight));
-        termDocFreq.set(term, (termDocFreq.get(term) ?? 0) + 1);
-      }
-    }
-
-    // 5. Filter by minimum document frequency and build ranked list
-    const ranked: TrendScore[] = [];
-    for (const [topic, score] of termScore) {
-      const docFreq = termDocFreq.get(topic) ?? 0;
-      if (docFreq < this.minDocFrequency) continue;
-      ranked.push({
-        topic,
-        score,
-        tfidfScore: termTFIDF.get(topic) ?? 0,
-        temporalWeight: termTemporal.get(topic) ?? 0,
-        velocity: termVelocity.get(topic) ?? 0,
-        documentFrequency: docFreq,
-      });
-    }
-    ranked.sort((a, b) => b.score - a.score);
-
-    const topTopics = ranked.slice(0, this.topN);
-
-    const window: PredictionWindow = {
-      generatedAt: new Date(nowMs).toISOString(),
-      windowStart: nowMs,
-      windowEnd: nowMs + this.predictionHorizonMs,
-      topTopics,
-      documentCount: docs.length,
-    };
-
-    this.lastPrediction = window;
-    logger.info(
-      { topics: topTopics.map((t) => t.topic), documentCount: docs.length },
-      'TrendPredictor prediction generated',
-    );
-    return window;
-  }
-
-  /**
-   * Returns the most recent prediction without recomputing.
-   * Returns null if `predict()` has never been called.
-   */
-  getLastPrediction(): PredictionWindow | null {
+  /** Return the last prediction set (or null if never produced). */
+  getLastPrediction(): TrendPredictionSet | null {
     return this.lastPrediction;
   }
 
   /**
-   * Returns all documents currently held in the analysis corpus.
+   * Produce a fresh prediction set from the supplied broadcast corpus.
+   *
+   * The corpus is expected to be unordered — we will filter anything outside
+   * the analysis window and sort internally.
    */
-  getCorpusSize(): number {
-    return this.documents.length;
-  }
+  predict(broadcasts: readonly BroadcastRecord[]): TrendPredictionSet {
+    const generatedAtDate = this.now();
+    const windowEndMs = generatedAtDate.getTime();
+    const windowStartMs = windowEndMs - this.analysisWindowHours * 3_600_000;
 
-  // -------------------------------------------------------------------------
-  // Velocity analysis
-  // -------------------------------------------------------------------------
+    const inWindow = broadcasts.filter((b) => {
+      const t = epochOf(b.postedAt);
+      return t >= windowStartMs && t <= windowEndMs;
+    });
 
-  /**
-   * Identify "rising" topics — those whose engagement velocity is in the top
-   * quartile of all scored terms.  Useful for real-time surfacing of breakout
-   * content before it becomes mainstream.
-   */
-  getRisingTopics(prediction: PredictionWindow): readonly TrendScore[] {
-    if (prediction.topTopics.length === 0) return [];
-    const sorted = [...prediction.topTopics].sort((a, b) => b.velocity - a.velocity);
-    const cutoff = Math.ceil(sorted.length * 0.25);
-    return sorted.slice(0, Math.max(1, cutoff));
-  }
-
-  // -------------------------------------------------------------------------
-  // Scheduler
-  // -------------------------------------------------------------------------
-
-  /**
-   * Start the automatic 30-minute refresh scheduler.
-   * Safe to call multiple times — will not create duplicate intervals.
-   */
-  startScheduler(onPrediction?: (window: PredictionWindow) => void): void {
-    if (this.schedulerHandle !== null) return;
-    this.schedulerHandle = setInterval(() => {
-      const result = this.predict();
-      onPrediction?.(result);
-    }, this.refreshIntervalMs);
-    logger.info({ intervalMs: this.refreshIntervalMs }, 'TrendPredictor scheduler started');
-  }
-
-  /**
-   * Stop the automatic refresh scheduler.
-   */
-  stopScheduler(): void {
-    if (this.schedulerHandle !== null) {
-      clearInterval(this.schedulerHandle);
-      this.schedulerHandle = null;
-      logger.info('TrendPredictor scheduler stopped');
+    if (inWindow.length === 0) {
+      const empty: TrendPredictionSet = {
+        analysisWindowHours: this.analysisWindowHours,
+        forecastHorizonHours: this.forecastHorizonHours,
+        generatedAt: generatedAtDate.toISOString(),
+        predictions: [],
+        sampleSize: 0,
+        vocabularySize: 0,
+      };
+      this.lastPrediction = empty;
+      logger.debug({ sampleSize: 0 }, 'TrendPredictor produced empty prediction');
+      return empty;
     }
-  }
 
-  // -------------------------------------------------------------------------
-  // Utilities
-  // -------------------------------------------------------------------------
+    const bucketSizeMs =
+      (this.analysisWindowHours * 3_600_000) / this.velocityBuckets;
 
-  /**
-   * Clear all ingested documents and reset the last prediction.
-   */
-  reset(): void {
-    this.documents = [];
-    this.lastPrediction = null;
-  }
+    const termStats = new Map<string, TermStat>();
+    const pairs = new Map<string, PairCooccurrence>();
+    const totalDocs = inWindow.length;
 
-  /**
-   * Return a lightweight snapshot of current corpus statistics.
-   */
-  corpusStats(): {
-    documentCount: number;
-    oldestPublishedAt: number | null;
-    newestPublishedAt: number | null;
-    avgEngagement: number;
-  } {
-    if (this.documents.length === 0) {
-      return { documentCount: 0, oldestPublishedAt: null, newestPublishedAt: null, avgEngagement: 0 };
+    for (const b of inWindow) {
+      const tokens = tokenise(b.text);
+      const extraTags = (b.tags ?? []).map((t) => t.toLowerCase().trim()).filter(Boolean);
+      const terms = new Set<string>([...tokens, ...extraTags]);
+
+      if (this.includeBigrams) {
+        for (const bg of bigrams(tokens)) {
+          terms.add(bg);
+        }
+      }
+
+      const postedMs = epochOf(b.postedAt);
+      const ageHours = Math.max(0, (windowEndMs - postedMs) / 3_600_000);
+      const recencyWeight = Math.pow(0.5, ageHours / this.temporalHalfLifeHours);
+      const weightedEngagement =
+        (1 + Math.log1p(Math.max(0, b.engagement))) * recencyWeight;
+
+      const bucketIndex = clamp(
+        Math.floor((postedMs - windowStartMs) / bucketSizeMs),
+        0,
+        this.velocityBuckets - 1,
+      );
+
+      for (const term of terms) {
+        let stat = termStats.get(term);
+        if (!stat) {
+          stat = {
+            term,
+            termFrequency: 0,
+            documentFrequency: 0,
+            engagement: 0,
+            supporting: new Set<string>(),
+            bucketEngagement: new Array<number>(this.velocityBuckets).fill(0),
+          };
+          termStats.set(term, stat);
+        }
+        stat.termFrequency += weightedEngagement;
+        stat.documentFrequency += 1;
+        stat.engagement += Math.max(0, b.engagement);
+        stat.supporting.add(b.id);
+        stat.bucketEngagement[bucketIndex] += Math.max(0, b.engagement);
+      }
+
+      // Co-occurrence for related terms — only from unigram list to keep
+      // the pair space bounded.
+      const uniqueUnigrams = Array.from(new Set(tokens));
+      for (let i = 0; i < uniqueUnigrams.length; i += 1) {
+        for (let j = i + 1; j < uniqueUnigrams.length; j += 1) {
+          const [firstTerm, secondTerm] = [uniqueUnigrams[i], uniqueUnigrams[j]].sort();
+          const key = `${firstTerm}||${secondTerm}`;
+          const existing = pairs.get(key);
+          if (existing) {
+            existing.count += 1;
+            existing.engagement += Math.max(0, b.engagement);
+          } else {
+            pairs.set(key, { count: 1, engagement: Math.max(0, b.engagement) });
+          }
+        }
+      }
     }
-    let oldest = Infinity;
-    let newest = -Infinity;
-    let totalEng = 0;
-    for (const d of this.documents) {
-      if (d.publishedAt < oldest) oldest = d.publishedAt;
-      if (d.publishedAt > newest) newest = d.publishedAt;
-      totalEng += d.engagementCount;
+
+    // Filter out very-low-support terms.
+    const eligible = Array.from(termStats.values()).filter(
+      (s) => s.documentFrequency >= this.minDocumentFrequency,
+    );
+
+    // Precompute IDF and scores.
+    const scored = eligible.map((s) => {
+      const idf = Math.log((1 + totalDocs) / (1 + s.documentFrequency)) + 1;
+      const tfIdf = s.termFrequency * idf;
+      return { stat: s, tfIdf };
+    });
+
+    // Velocity and acceleration per term.
+    const scoredWithDynamics = scored.map((entry) => {
+      const buckets = entry.stat.bucketEngagement;
+      // Velocity = average delta over last half of buckets minus first half.
+      const half = Math.floor(buckets.length / 2);
+      const earlySum = buckets.slice(0, half).reduce((a, b) => a + b, 0);
+      const lateSum = buckets.slice(half).reduce((a, b) => a + b, 0);
+      const velocity =
+        (lateSum - earlySum) / Math.max(1, this.analysisWindowHours / 2);
+
+      // Acceleration = difference between the last two deltas.
+      let acceleration = 0;
+      if (buckets.length >= 3) {
+        const d1 = buckets[buckets.length - 1] - buckets[buckets.length - 2];
+        const d2 = buckets[buckets.length - 2] - buckets[buckets.length - 3];
+        acceleration = d1 - d2;
+      }
+
+      // Composite score boosts rising trends slightly above mature ones.
+      const risingBoost = acceleration > 0 ? 1 + Math.log1p(acceleration) * 0.2 : 1;
+      const velocityBoost = 1 + Math.log1p(Math.max(0, velocity)) * 0.25;
+      const composite = entry.tfIdf * risingBoost * velocityBoost;
+
+      return {
+        stat: entry.stat,
+        tfIdf: entry.tfIdf,
+        velocity,
+        acceleration,
+        rising: acceleration > 0 && velocity >= 0,
+        composite,
+      };
+    });
+
+    scoredWithDynamics.sort((a, b) => b.composite - a.composite);
+
+    // Build predictions with related terms via co-occurrence.
+    const predictions: TrendPrediction[] = [];
+    const seen = new Set<string>();
+
+    for (const entry of scoredWithDynamics) {
+      if (predictions.length >= this.topK) break;
+      const term = entry.stat.term;
+      if (seen.has(term)) continue;
+      seen.add(term);
+
+      const related = this.collectRelatedTerms(term, pairs, seen);
+
+      const prediction: TrendPrediction = {
+        id: `trend_${stableHash(`${term}:${generatedAtDate.toISOString()}`)}`,
+        term,
+        relatedTerms: related,
+        score: Math.round(entry.composite * 1000) / 1000,
+        velocity: Math.round(entry.velocity * 1000) / 1000,
+        acceleration: Math.round(entry.acceleration * 1000) / 1000,
+        rising: entry.rising,
+        supportingBroadcastIds: Array.from(entry.stat.supporting).slice(0, 12),
+        predictedAt: generatedAtDate.toISOString(),
+      };
+      predictions.push(prediction);
     }
-    return {
-      documentCount: this.documents.length,
-      oldestPublishedAt: oldest,
-      newestPublishedAt: newest,
-      avgEngagement: totalEng / this.documents.length,
+
+    const set: TrendPredictionSet = {
+      analysisWindowHours: this.analysisWindowHours,
+      forecastHorizonHours: this.forecastHorizonHours,
+      generatedAt: generatedAtDate.toISOString(),
+      predictions,
+      sampleSize: totalDocs,
+      vocabularySize: termStats.size,
     };
+
+    this.lastPrediction = set;
+
+    logger.debug(
+      {
+        sampleSize: totalDocs,
+        vocabularySize: termStats.size,
+        top: predictions.slice(0, 3).map((p) => p.term),
+      },
+      'TrendPredictor produced predictions',
+    );
+
+    return set;
   }
+
+  /**
+   * Produce a list of top terms only — useful for lightweight use cases
+   * where a caller doesn't need the full trend envelope.
+   */
+  topTerms(broadcasts: readonly BroadcastRecord[], limit = this.topK): TrendTerm[] {
+    const set = this.predict(broadcasts);
+    return set.predictions.slice(0, limit).map((p) => ({
+      term: p.term,
+      score: p.score,
+      documentFrequency: p.supportingBroadcastIds.length,
+      engagement: 0,
+    }));
+  }
+
+  /**
+   * Classify an arbitrary text against the most recent prediction set.
+   * Returns the best matching prediction, or null if none match.
+   */
+  classifyText(text: string): TrendPrediction | null {
+    if (!this.lastPrediction) return null;
+    const tokens = new Set(tokenise(text));
+    let best: TrendPrediction | null = null;
+    let bestMatch = 0;
+    for (const p of this.lastPrediction.predictions) {
+      let matches = 0;
+      if (tokens.has(p.term)) matches += 2;
+      for (const rel of p.relatedTerms) {
+        if (tokens.has(rel)) matches += 1;
+      }
+      if (matches > bestMatch) {
+        bestMatch = matches;
+        best = p;
+      }
+    }
+    return bestMatch > 0 ? best : null;
+  }
+
+  private collectRelatedTerms(
+    term: string,
+    pairs: Map<string, PairCooccurrence>,
+    exclude: ReadonlySet<string>,
+  ): string[] {
+    // For bi-gram trends, we don't have pair data — return the constituent
+    // tokens as related terms.
+    if (term.includes(' ')) {
+      return term.split(' ').filter((t) => !exclude.has(t)).slice(0, 4);
+    }
+
+    const matches: Array<{ other: string; weight: number }> = [];
+    for (const [key, value] of pairs.entries()) {
+      const [a, b] = key.split('||');
+      if (a === term && !exclude.has(b)) {
+        matches.push({ other: b, weight: value.count + Math.log1p(value.engagement) });
+      } else if (b === term && !exclude.has(a)) {
+        matches.push({ other: a, weight: value.count + Math.log1p(value.engagement) });
+      }
+    }
+    matches.sort((x, y) => y.weight - x.weight);
+    return matches.slice(0, 4).map((m) => m.other);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal timer primitives that we can stub in tests.  Mirrors the
+ * approach used by {@link PhantomSocialService}.
+ */
+export interface TrendSchedulerApi {
+  setInterval(fn: () => void, ms: number): { id: number };
+  clearInterval(handle: { id: number }): void;
+}
+
+/** Default scheduler — wraps the global setInterval / clearInterval. */
+export const defaultTrendScheduler: TrendSchedulerApi = {
+  setInterval(fn, ms) {
+    const id = setInterval(fn, ms) as unknown as number;
+    return { id };
+  },
+  clearInterval(handle) {
+    clearInterval(handle.id as unknown as ReturnType<typeof setInterval>);
+  },
+};
+
+export interface ScheduledPredictorOptions {
+  /** Hours of prediction cadence.  Defaults to 0.5 hours (30 minutes). */
+  readonly refreshIntervalHours?: number;
+  /** Scheduler primitive. */
+  readonly scheduler?: TrendSchedulerApi;
+  /** Fetches the current broadcast corpus to re-predict on. */
+  readonly fetchBroadcasts: () => Promise<readonly BroadcastRecord[]> | readonly BroadcastRecord[];
+  /** Optional callback on each completed prediction cycle. */
+  readonly onPrediction?: (set: TrendPredictionSet) => void;
+  /** Optional error callback. */
+  readonly onError?: (err: unknown) => void;
+}
+
+/**
+ * Start an auto-refreshing trend predictor.  Returns a disposer that stops
+ * the interval.  Runs one prediction eagerly on start so consumers always
+ * have something to read.
+ */
+export function startScheduledPredictor(
+  predictor: TrendPredictor,
+  options: ScheduledPredictorOptions,
+): () => void {
+  const scheduler = options.scheduler ?? defaultTrendScheduler;
+  const intervalMs = (options.refreshIntervalHours ?? 0.5) * 3_600_000;
+
+  let disposed = false;
+
+  const tick = async (): Promise<void> => {
+    if (disposed) return;
+    try {
+      const corpus = await options.fetchBroadcasts();
+      const set = predictor.predict(corpus);
+      options.onPrediction?.(set);
+    } catch (err) {
+      options.onError?.(err);
+      logger.warn({ err }, 'TrendPredictor scheduled tick failed');
+    }
+  };
+
+  // Eager first run.
+  void tick();
+  const handle = scheduler.setInterval(() => {
+    void tick();
+  }, intervalMs);
+
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    scheduler.clearInterval(handle);
+  };
 }
 
 export default TrendPredictor;

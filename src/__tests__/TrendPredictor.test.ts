@@ -1,230 +1,173 @@
-import { TrendPredictor, BroadcastDocument } from '../services/TrendPredictor';
+import {
+  TrendPredictor,
+  tokenise,
+  bigrams,
+  startScheduledPredictor,
+  type BroadcastRecord,
+  type TrendSchedulerApi,
+} from '../services/TrendPredictor';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-const BASE_TIME = new Date('2026-04-17T12:00:00Z').getTime();
-
-function makeDoc(
+function makeBroadcast(
   id: string,
-  content: string,
-  ageHours: number,
-  engagementCount = 100,
-  engagementDelta?: number,
-): BroadcastDocument {
-  return {
-    id,
-    content,
-    publishedAt: BASE_TIME - ageHours * 60 * 60 * 1_000,
-    engagementCount,
-    engagementDelta,
-  };
+  text: string,
+  postedAt: Date,
+  engagement = 100,
+  authorId = `author-${id}`,
+  tags: string[] = [],
+): BroadcastRecord {
+  return { id, text, postedAt, engagement, authorId, tags };
 }
 
-function makePredictor(options: ConstructorParameters<typeof TrendPredictor>[0] = {}) {
-  return new TrendPredictor({ now: () => BASE_TIME, ...options });
-}
-
-// ---------------------------------------------------------------------------
-// Ingestion
-// ---------------------------------------------------------------------------
-
-describe('TrendPredictor — ingestion', () => {
-  it('accepts and stores documents within the analysis window', () => {
-    const tp = makePredictor();
-    tp.ingest(makeDoc('1', 'machine learning neural networks', 1));
-    tp.ingest(makeDoc('2', 'deep learning transformers', 2));
-    expect(tp.getCorpusSize()).toBe(2);
+describe('TrendPredictor — tokenisation', () => {
+  it('lowercases, strips punctuation and stopwords', () => {
+    expect(tokenise("It's the Alpha, bro — ALPHA!")).toEqual(["it's", 'alpha', 'bro', 'alpha']);
   });
 
-  it('rejects documents outside the 24-hour window', () => {
-    const tp = makePredictor();
-    tp.ingest(makeDoc('old', 'outdated topic', 25)); // 25 hours ago
-    expect(tp.getCorpusSize()).toBe(0);
+  it('filters tokens under three characters', () => {
+    expect(tokenise('to be or not to be')).toEqual([]);
   });
 
-  it('accepts an array of documents in a single call', () => {
-    const tp = makePredictor();
-    tp.ingest([
-      makeDoc('a', 'topic alpha beta gamma', 1),
-      makeDoc('b', 'topic delta epsilon zeta', 2),
-      makeDoc('c', 'topic eta theta iota', 3),
+  it('produces bi-grams from ordered token list', () => {
+    expect(bigrams(['alpha', 'decay', 'signal'])).toEqual([
+      'alpha decay',
+      'decay signal',
     ]);
-    expect(tp.getCorpusSize()).toBe(3);
-  });
-
-  it('evicts stale documents on evictStale()', () => {
-    const tp = makePredictor();
-    tp.ingest(makeDoc('1', 'recent topic content here', 1));
-    // Manually push a stale entry (bypass age check by manipulating internal)
-    (tp as unknown as { documents: BroadcastDocument[] }).documents.push(
-      makeDoc('stale', 'stale topic content', 26),
-    );
-    expect(tp.getCorpusSize()).toBe(2);
-    tp.evictStale();
-    expect(tp.getCorpusSize()).toBe(1);
   });
 });
 
-// ---------------------------------------------------------------------------
-// Prediction
-// ---------------------------------------------------------------------------
-
-describe('TrendPredictor — prediction', () => {
-  it('returns an empty prediction when the corpus is empty', () => {
-    const tp = makePredictor();
-    const result = tp.predict();
-    expect(result.topTopics).toHaveLength(0);
-    expect(result.documentCount).toBe(0);
+describe('TrendPredictor — prediction pipeline', () => {
+  const nowDate = new Date('2026-04-17T12:00:00Z');
+  const predictor = new TrendPredictor({
+    now: () => nowDate,
+    analysisWindowHours: 24,
+    forecastHorizonHours: 6,
+    topK: 5,
+    minDocumentFrequency: 2,
+    velocityBuckets: 6,
+    temporalHalfLifeHours: 4,
   });
 
-  it('surfaces terms that appear in multiple documents', () => {
-    const tp = makePredictor({ minDocFrequency: 2 });
-    tp.ingest([
-      makeDoc('1', 'quantitative finance derivatives pricing volatility surface', 1, 500),
-      makeDoc('2', 'quantitative analysis derivatives risk management', 2, 400),
-      makeDoc('3', 'machine learning neural networks deep learning', 3, 300),
+  const sample: BroadcastRecord[] = [
+    makeBroadcast('b1', 'alpha decay regime shift observed', new Date('2026-04-17T11:50:00Z'), 500),
+    makeBroadcast('b2', 'alpha decay accelerating in volatile regime', new Date('2026-04-17T11:55:00Z'), 700),
+    makeBroadcast('b3', 'order flow toxicity at dark pool venues', new Date('2026-04-17T11:00:00Z'), 200),
+    makeBroadcast('b4', 'order flow toxicity spiking on close', new Date('2026-04-17T11:30:00Z'), 220),
+    makeBroadcast('b5', 'random unrelated note about lunch', new Date('2026-04-16T14:00:00Z'), 10),
+  ];
+
+  it('returns predictions sorted by composite score', () => {
+    const set = predictor.predict(sample);
+    expect(set.sampleSize).toBe(5);
+    expect(set.predictions.length).toBeGreaterThan(0);
+    const scores = set.predictions.map((p) => p.score);
+    const sorted = [...scores].sort((a, b) => b - a);
+    expect(scores).toEqual(sorted);
+  });
+
+  it('flags accelerating trends as rising', () => {
+    const set = predictor.predict(sample);
+    const alpha = set.predictions.find((p) => p.term === 'alpha' || p.term === 'decay');
+    expect(alpha).toBeDefined();
+    expect(alpha!.rising).toBe(true);
+  });
+
+  it('ignores broadcasts outside the analysis window', () => {
+    const old = makeBroadcast('old', 'alpha decay historical', new Date('2026-04-10T00:00:00Z'), 9999);
+    const set = predictor.predict([...sample, old]);
+    expect(set.sampleSize).toBe(5);
+  });
+
+  it('returns an empty envelope when no broadcasts are in-window', () => {
+    const set = predictor.predict([
+      makeBroadcast('x', 'ancient broadcast', new Date('2020-01-01T00:00:00Z')),
     ]);
-    const result = tp.predict();
-    const topics = result.topTopics.map((t) => t.topic);
-    // "quantitative" and "derivatives" appear in 2 docs; ML terms appear in only 1
-    expect(topics).toContain('derivatives');
+    expect(set.predictions).toHaveLength(0);
+    expect(set.vocabularySize).toBe(0);
   });
 
-  it('returns at most topN topics', () => {
-    const tp = makePredictor({ topN: 5, minDocFrequency: 1 });
-    for (let i = 0; i < 20; i++) {
-      tp.ingest(makeDoc(String(i), `unique term${i} shared alpha beta gamma delta`, 1 + i * 0.1));
-    }
-    const result = tp.predict();
-    expect(result.topTopics.length).toBeLessThanOrEqual(5);
+  it('caches the last prediction for getLastPrediction', () => {
+    predictor.predict(sample);
+    const cached = predictor.getLastPrediction();
+    expect(cached).not.toBeNull();
+    expect(cached!.predictions.length).toBeGreaterThan(0);
   });
 
-  it('scores recent documents higher than old ones (same content)', () => {
-    const tp = makePredictor({ minDocFrequency: 1 });
-    // Same content, different ages — the recent one should rank higher
-    tp.ingest(makeDoc('new', 'emerging algorithm strategy edge', 0.5, 100, 50));
-    tp.ingest(makeDoc('old', 'emerging algorithm strategy edge', 23, 100, 50));
-    const result = tp.predict();
-    expect(result.topTopics.length).toBeGreaterThan(0);
-    // Temporal weights differ so the aggregate will reflect recency
-    const firstTopic = result.topTopics[0];
-    expect(firstTopic.score).toBeGreaterThan(0);
+  it('classifyText finds the best matching trend from last prediction', () => {
+    predictor.predict(sample);
+    const match = predictor.classifyText('latest alpha decay update');
+    expect(match).not.toBeNull();
+    expect(['alpha', 'decay', 'alpha decay']).toContain(match!.term);
   });
 
-  it('populates the prediction window timestamps correctly', () => {
-    const tp = makePredictor();
-    const result = tp.predict();
-    expect(result.generatedAt).toBe(new Date(BASE_TIME).toISOString());
-    expect(result.windowEnd).toBe(BASE_TIME + 6 * 60 * 60 * 1_000);
+  it('classifyText returns null when no predictions exist', () => {
+    const p = new TrendPredictor({ now: () => nowDate });
+    expect(p.classifyText('some text')).toBeNull();
   });
 
-  it('stores the last prediction for retrieval without recomputing', () => {
-    const tp = makePredictor({ minDocFrequency: 1 });
-    tp.ingest(makeDoc('1', 'blockchain distributed ledger consensus', 1, 200));
-    tp.ingest(makeDoc('2', 'blockchain protocol nodes miners', 2, 150));
-    const first = tp.predict();
-    const cached = tp.getLastPrediction();
-    expect(cached).toBe(first); // Same reference
-  });
-
-  it('getLastPrediction returns null before first predict()', () => {
-    const tp = makePredictor();
-    expect(tp.getLastPrediction()).toBeNull();
+  it('throws when given invalid options', () => {
+    expect(() => new TrendPredictor({ analysisWindowHours: 0 })).toThrow();
+    expect(() => new TrendPredictor({ velocityBuckets: 1 })).toThrow();
   });
 });
 
-// ---------------------------------------------------------------------------
-// Rising topics
-// ---------------------------------------------------------------------------
+describe('TrendPredictor — startScheduledPredictor', () => {
+  it('invokes an eager first prediction and then on interval', async () => {
+    let currentTime = Date.parse('2026-04-17T12:00:00Z');
+    const predictor = new TrendPredictor({
+      now: () => new Date(currentTime),
+      analysisWindowHours: 24,
+      minDocumentFrequency: 1,
+    });
+    const intervals: Array<() => void> = [];
+    const scheduler: TrendSchedulerApi = {
+      setInterval: (fn) => {
+        intervals.push(fn);
+        return { id: intervals.length };
+      },
+      clearInterval: () => {
+        /* no-op for test */
+      },
+    };
+    const corpus = [
+      makeBroadcast('b', 'signal processing alpha', new Date(currentTime - 1000), 300),
+      makeBroadcast('b2', 'signal processing kalman', new Date(currentTime - 2000), 300),
+    ];
+    let cycles = 0;
+    const dispose = startScheduledPredictor(predictor, {
+      scheduler,
+      refreshIntervalHours: 0.5,
+      fetchBroadcasts: () => corpus,
+      onPrediction: () => {
+        cycles += 1;
+      },
+    });
 
-describe('TrendPredictor — getRisingTopics', () => {
-  it('returns a subset of the top topics sorted by velocity', () => {
-    const tp = makePredictor({ minDocFrequency: 1 });
-    for (let i = 0; i < 8; i++) {
-      tp.ingest(makeDoc(String(i), `topic${i} shared content signal`, 1 + i, 100 + i * 50, i * 10));
-    }
-    const prediction = tp.predict();
-    const rising = tp.getRisingTopics(prediction);
-    expect(rising.length).toBeGreaterThan(0);
-    expect(rising.length).toBeLessThanOrEqual(Math.ceil(prediction.topTopics.length * 0.25));
+    await new Promise((r) => setImmediate(r));
+    expect(cycles).toBe(1);
+
+    currentTime += 30 * 60 * 1000;
+    intervals[0]?.();
+    await new Promise((r) => setImmediate(r));
+    expect(cycles).toBe(2);
+
+    dispose();
   });
 
-  it('handles empty prediction gracefully', () => {
-    const tp = makePredictor();
-    const empty = tp.predict();
-    expect(tp.getRisingTopics(empty)).toHaveLength(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// corpusStats
-// ---------------------------------------------------------------------------
-
-describe('TrendPredictor — corpusStats', () => {
-  it('returns null timestamps and zero counts for an empty corpus', () => {
-    const tp = makePredictor();
-    const stats = tp.corpusStats();
-    expect(stats.documentCount).toBe(0);
-    expect(stats.oldestPublishedAt).toBeNull();
-    expect(stats.newestPublishedAt).toBeNull();
-    expect(stats.avgEngagement).toBe(0);
-  });
-
-  it('computes correct stats for a populated corpus', () => {
-    const tp = makePredictor();
-    tp.ingest([
-      makeDoc('1', 'content one here now', 1, 100),
-      makeDoc('2', 'content two here now', 2, 200),
-      makeDoc('3', 'content three here now', 3, 300),
-    ]);
-    const stats = tp.corpusStats();
-    expect(stats.documentCount).toBe(3);
-    expect(stats.avgEngagement).toBeCloseTo(200);
-    expect(stats.newestPublishedAt).toBeGreaterThan(stats.oldestPublishedAt!);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Reset
-// ---------------------------------------------------------------------------
-
-describe('TrendPredictor — reset', () => {
-  it('clears corpus and last prediction', () => {
-    const tp = makePredictor({ minDocFrequency: 1 });
-    tp.ingest(makeDoc('1', 'some content here now today', 1));
-    tp.predict();
-    tp.reset();
-    expect(tp.getCorpusSize()).toBe(0);
-    expect(tp.getLastPrediction()).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Scheduler (basic)
-// ---------------------------------------------------------------------------
-
-describe('TrendPredictor — scheduler', () => {
-  beforeEach(() => jest.useFakeTimers());
-  afterEach(() => jest.useRealTimers());
-
-  it('fires the callback at each refresh interval', () => {
-    const tp = new TrendPredictor({ refreshIntervalMs: 1_000 });
-    const spy = jest.fn();
-    tp.startScheduler(spy);
-    jest.advanceTimersByTime(3_100);
-    tp.stopScheduler();
-    expect(spy).toHaveBeenCalledTimes(3);
-  });
-
-  it('does not create duplicate intervals when called twice', () => {
-    const tp = new TrendPredictor({ refreshIntervalMs: 1_000 });
-    const spy = jest.fn();
-    tp.startScheduler(spy);
-    tp.startScheduler(spy); // second call should be a no-op
-    jest.advanceTimersByTime(1_100);
-    tp.stopScheduler();
-    expect(spy).toHaveBeenCalledTimes(1);
+  it('surfaces fetch errors via onError', async () => {
+    const predictor = new TrendPredictor();
+    const errors: unknown[] = [];
+    const dispose = startScheduledPredictor(predictor, {
+      scheduler: {
+        setInterval: () => ({ id: 1 }),
+        clearInterval: () => undefined,
+      },
+      fetchBroadcasts: () => {
+        throw new Error('boom');
+      },
+      onError: (err) => errors.push(err),
+    });
+    await new Promise((r) => setImmediate(r));
+    expect(errors.length).toBe(1);
+    dispose();
   });
 });
