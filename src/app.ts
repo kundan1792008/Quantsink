@@ -54,7 +54,7 @@ app.use('/api/v1/posts',       apiLimiter,   postsRouter);
 app.use('/api/v1/connections', writeLimiter, connectionsRouter);
 app.use('/api/v1/dms',         writeLimiter, dmsRouter);
 app.use('/api/v1/broadcasts',  writeLimiter, broadcastsRouter);
-app.use('/api/influence',      apiLimiter,   influenceRouter);
+app.use('/api/v1/influence',   apiLimiter,   influenceRouter);
 
 // ---------------------------------------------------------------------------
 // WebSocket stats endpoint

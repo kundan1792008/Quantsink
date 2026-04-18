@@ -14,197 +14,50 @@ datasource db {
 // User (identity comes from Quantmail Biometric SSO — no local passwords)
 // ---------------------------------------------------------------------------
 model User {
-  id                 String   @id @default(uuid())
-  quantmailId        String   @unique // External Quantmail user ID
-  email              String   @unique
-  displayName        String
-  headline           String? // "Senior Engineer @ ..."
-  bio                String?
-  avatarUrl          String?
-  isVerified         Boolean  @default(false)
-  digitalTwinEnabled Boolean  @default(false) // Opt-in for AI Digital Twin
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  id              String   @id @default(uuid())
+  quantmailId     String   @unique          // External Quantmail user ID
+  email           String   @unique
+  displayName     String
+  headline        String?                   // "Senior Engineer @ ..."
+  bio             String?
+  avatarUrl       String?
+  isVerified      Boolean  @default(false)
+  digitalTwinEnabled Boolean @default(false) // Opt-in for AI Digital Twin
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   // Relations
-  shortPosts           ShortPost[]
-  deepPosts            DeepPost[]
-  skills               UserSkill[]
-  endorsementsGiven    Endorsement[]   @relation("EndorserRelation")
-  endorsementsReceived Endorsement[]   @relation("EndorsedRelation")
-  connectionsFrom      Connection[]    @relation("ConnectionFrom")
-  connectionsTo        Connection[]    @relation("ConnectionTo")
-  followersOf          Follow[]        @relation("FollowTarget")
-  following            Follow[]        @relation("FollowSource")
-  dmsSent              DirectMessage[] @relation("DMSender")
-  dmsReceived          DirectMessage[] @relation("DMReceiver")
-  broadcasts           Broadcast[]
-
-  // Influence Score system (issue #16)
-  influenceScore         InfluenceScore?
-  scoreHistory           InfluenceScoreHistory[]
-  boostEvents            InfluenceBoostEvent[]
-  challengesStarted      InfluenceChallenge[]     @relation("ChallengeOwner")
-  reportsFiled           UserReport[]             @relation("ReporterRelation")
-  reportsReceived        UserReport[]             @relation("ReportedRelation")
-  crossAppActivities     CrossAppActivity[]
-  qualityRatingsAuthored BroadcastQualityRating[] @relation("QualityRatingAuthor")
+  shortPosts      ShortPost[]
+  deepPosts       DeepPost[]
+  skills          UserSkill[]
+  endorsementsGiven  Endorsement[] @relation("EndorserRelation")
+  endorsementsReceived Endorsement[] @relation("EndorsedRelation")
+  connectionsFrom Connection[] @relation("ConnectionFrom")
+  connectionsTo   Connection[] @relation("ConnectionTo")
+  followersOf     Follow[]     @relation("FollowTarget")
+  following       Follow[]     @relation("FollowSource")
+  dmsSent         DirectMessage[] @relation("DMSender")
+  dmsReceived     DirectMessage[] @relation("DMReceiver")
+  broadcasts      Broadcast[]
+  influenceScore  InfluenceScore?
 
   @@index([quantmailId])
   @@index([email])
 }
 
 // ---------------------------------------------------------------------------
-// Influence Score system (issue #16) — ecosystem-wide reputation (0–1000)
-// ---------------------------------------------------------------------------
-model InfluenceScore {
-  id                 String        @id @default(uuid())
-  user               User          @relation(fields: [userId], references: [id])
-  userId             String        @unique
-  total              Int           @default(0)
-  broadcastQuality   Int           @default(0) // 0–100
-  engagementRate     Int           @default(0) // 0–100
-  consistency        Int           @default(0) // 0–100
-  biometricLevel     Int           @default(0) // 0–100
-  crossAppActivity   Int           @default(0) // 0–100
-  communityStanding  Int           @default(0) // 0–100
-  tier               InfluenceTier @default(BRONZE)
-  lastRecalculatedAt DateTime      @default(now())
-  updatedAt          DateTime      @updatedAt
-
-  @@index([total(sort: Desc)])
-  @@index([tier])
-}
-
-enum InfluenceTier {
-  BRONZE
-  SILVER
-  GOLD
-  PLATINUM
-  DIAMOND
-}
-
-model InfluenceScoreHistory {
-  id                String        @id @default(uuid())
-  user              User          @relation(fields: [userId], references: [id])
-  userId            String
-  total             Int
-  broadcastQuality  Int
-  engagementRate    Int
-  consistency       Int
-  biometricLevel    Int
-  crossAppActivity  Int
-  communityStanding Int
-  tier              InfluenceTier
-  snapshotAt        DateTime      @default(now())
-
-  @@index([userId, snapshotAt(sort: Desc)])
-  @@index([snapshotAt])
-}
-
-model InfluenceBoostEvent {
-  id         String    @id @default(uuid())
-  user       User      @relation(fields: [userId], references: [id])
-  userId     String
-  reason     String
-  points     Int
-  startsAt   DateTime  @default(now())
-  expiresAt  DateTime
-  consumedAt DateTime?
-  createdAt  DateTime  @default(now())
-
-  @@index([userId, expiresAt])
-}
-
-model InfluenceChallenge {
-  id           String                   @id @default(uuid())
-  owner        User                     @relation("ChallengeOwner", fields: [ownerId], references: [id])
-  ownerId      String
-  kind         InfluenceChallengeKind
-  status       InfluenceChallengeStatus @default(ACTIVE)
-  progress     Int                      @default(0)
-  target       Int
-  rewardPoints Int                      @default(50)
-  startedAt    DateTime                 @default(now())
-  expiresAt    DateTime
-  completedAt  DateTime?
-
-  @@index([ownerId, status])
-  @@index([expiresAt])
-}
-
-enum InfluenceChallengeKind {
-  POST_STREAK
-  BIOMETRIC_WEEK
-  CROSS_APP_EXPLORER
-  QUALITY_AUTHOR
-  COMMUNITY_UPLIFT
-}
-
-enum InfluenceChallengeStatus {
-  ACTIVE
-  COMPLETED
-  EXPIRED
-  CANCELLED
-}
-
-model UserReport {
-  id         String   @id @default(uuid())
-  reporter   User     @relation("ReporterRelation", fields: [reporterId], references: [id])
-  reporterId String
-  reported   User     @relation("ReportedRelation", fields: [reportedId], references: [id])
-  reportedId String
-  reason     String
-  resolved   Boolean  @default(false)
-  upheld     Boolean  @default(false)
-  createdAt  DateTime @default(now())
-
-  @@index([reportedId, createdAt(sort: Desc)])
-}
-
-model CrossAppActivity {
-  id         String   @id @default(uuid())
-  user       User     @relation(fields: [userId], references: [id])
-  userId     String
-  appKey     String // e.g. "quantsink", "quantmail", "quantpay", ...
-  lastUsedAt DateTime @default(now())
-
-  @@unique([userId, appKey])
-  @@index([userId])
-}
-
-model BroadcastQualityRating {
-  id           String   @id @default(uuid())
-  author       User     @relation("QualityRatingAuthor", fields: [authorId], references: [id])
-  authorId     String
-  broadcastId  String
-  score        Int // 0–100
-  originality  Int
-  clarity      Int
-  relevance    Int
-  mediaQuality Int
-  grammar      Int
-  explanation  String   @db.Text
-  modelName    String
-  createdAt    DateTime @default(now())
-
-  @@index([authorId, createdAt(sort: Desc)])
-  @@index([broadcastId])
-}
-
-// ---------------------------------------------------------------------------
 // Professional Graph — Connections (bidirectional, like LinkedIn)
 // ---------------------------------------------------------------------------
 model Connection {
-  id         String           @id @default(uuid())
-  fromUser   User             @relation("ConnectionFrom", fields: [fromUserId], references: [id])
-  fromUserId String
-  toUser     User             @relation("ConnectionTo", fields: [toUserId], references: [id])
-  toUserId   String
-  status     ConnectionStatus @default(PENDING)
-  message    String? // Optional connect message
-  createdAt  DateTime         @default(now())
-  updatedAt  DateTime         @updatedAt
+  id          String           @id @default(uuid())
+  fromUser    User             @relation("ConnectionFrom", fields: [fromUserId], references: [id])
+  fromUserId  String
+  toUser      User             @relation("ConnectionTo", fields: [toUserId], references: [id])
+  toUserId    String
+  status      ConnectionStatus @default(PENDING)
+  message     String?          // Optional connect message
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
 
   @@unique([fromUserId, toUserId])
   @@index([toUserId, status])
@@ -221,12 +74,12 @@ enum ConnectionStatus {
 // Follow graph (unidirectional, like Twitter/Threads)
 // ---------------------------------------------------------------------------
 model Follow {
-  id        String   @id @default(uuid())
-  source    User     @relation("FollowSource", fields: [sourceId], references: [id])
-  sourceId  String
-  target    User     @relation("FollowTarget", fields: [targetId], references: [id])
-  targetId  String
-  createdAt DateTime @default(now())
+  id          String   @id @default(uuid())
+  source      User     @relation("FollowSource", fields: [sourceId], references: [id])
+  sourceId    String
+  target      User     @relation("FollowTarget", fields: [targetId], references: [id])
+  targetId    String
+  createdAt   DateTime @default(now())
 
   @@unique([sourceId, targetId])
   @@index([targetId])
@@ -236,20 +89,20 @@ model Follow {
 // Skills & Endorsements
 // ---------------------------------------------------------------------------
 model Skill {
-  id       String      @id @default(uuid())
-  name     String      @unique
-  category String?
-  users    UserSkill[]
+  id        String      @id @default(uuid())
+  name      String      @unique
+  category  String?
+  users     UserSkill[]
 }
 
 model UserSkill {
-  id           String        @id @default(uuid())
-  user         User          @relation(fields: [userId], references: [id])
-  userId       String
-  skill        Skill         @relation(fields: [skillId], references: [id])
-  skillId      String
+  id          String        @id @default(uuid())
+  user        User          @relation(fields: [userId], references: [id])
+  userId      String
+  skill       Skill         @relation(fields: [skillId], references: [id])
+  skillId     String
   endorsements Endorsement[]
-  createdAt    DateTime      @default(now())
+  createdAt   DateTime      @default(now())
 
   @@unique([userId, skillId])
   @@index([userId])
@@ -278,7 +131,7 @@ model ShortPost {
   id        String   @id @default(uuid())
   author    User     @relation(fields: [authorId], references: [id])
   authorId  String
-  content   String   @db.VarChar(500) // Hard 500-char limit
+  content   String   @db.VarChar(500)     // Hard 500-char limit
   mediaUrls String[]
   hashtags  String[]
   likes     Int      @default(0)
@@ -293,22 +146,22 @@ model ShortPost {
 
 // Deep posts — LinkedIn-style long-form articles / portfolio pieces
 model DeepPost {
-  id            String    @id @default(uuid())
-  author        User      @relation(fields: [authorId], references: [id])
+  id            String   @id @default(uuid())
+  author        User     @relation(fields: [authorId], references: [id])
   authorId      String
   title         String
-  summary       String?   @db.VarChar(300)
-  content       String    @db.Text // Rich-text / Markdown body
+  summary       String?  @db.VarChar(300)
+  content       String   @db.Text         // Rich-text / Markdown body
   coverImageUrl String?
   tags          String[]
-  readTimeMin   Int? // Estimated read time
-  likes         Int       @default(0)
-  views         Int       @default(0)
-  isPublished   Boolean   @default(false)
-  isDeleted     Boolean   @default(false)
+  readTimeMin   Int?                       // Estimated read time
+  likes         Int      @default(0)
+  views         Int      @default(0)
+  isPublished   Boolean  @default(false)
+  isDeleted     Boolean  @default(false)
   publishedAt   DateTime?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   @@index([authorId, createdAt(sort: Desc)])
   @@index([isPublished, publishedAt(sort: Desc)])
@@ -318,18 +171,18 @@ model DeepPost {
 // Direct Messages (Zero-Spam — tied to Quantmail shadow inbox)
 // ---------------------------------------------------------------------------
 model DirectMessage {
-  id            String     @id @default(uuid())
-  sender        User       @relation("DMSender", fields: [senderId], references: [id])
-  senderId      String
-  receiver      User       @relation("DMReceiver", fields: [receiverId], references: [id])
-  receiverId    String
-  content       String     @db.Text
-  spamScore     Float      @default(0) // 0-1 score from Quantmail filter
-  spamAction    SpamAction @default(DELIVERED)
-  isRead        Boolean    @default(false)
-  handledByTwin Boolean    @default(false) // Was replied to by Digital Twin
-  createdAt     DateTime   @default(now())
-  updatedAt     DateTime   @updatedAt
+  id          String    @id @default(uuid())
+  sender      User      @relation("DMSender",   fields: [senderId],   references: [id])
+  senderId    String
+  receiver    User      @relation("DMReceiver", fields: [receiverId], references: [id])
+  receiverId  String
+  content     String    @db.Text
+  spamScore   Float     @default(0)         // 0-1 score from Quantmail filter
+  spamAction  SpamAction @default(DELIVERED)
+  isRead      Boolean   @default(false)
+  handledByTwin Boolean @default(false)     // Was replied to by Digital Twin
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   @@index([receiverId, createdAt(sort: Desc)])
   @@index([senderId])
@@ -337,9 +190,9 @@ model DirectMessage {
 
 enum SpamAction {
   DELIVERED
-  SHADOW_INBOX // Moved to shadow inbox, visible only if user checks
-  NEGOTIATED // AI Twin replied to negotiate
-  DROPPED // Automatically discarded
+  SHADOW_INBOX   // Moved to shadow inbox, visible only if user checks
+  NEGOTIATED     // AI Twin replied to negotiate
+  DROPPED        // Automatically discarded
 }
 
 // ---------------------------------------------------------------------------
@@ -373,4 +226,79 @@ model SecurityAuditLog {
   blocked     Boolean  @default(true)
 
   @@index([timestamp(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Influence Score — Social Credit system (0-1000)
+// ---------------------------------------------------------------------------
+
+model InfluenceScore {
+  id                   String   @id @default(uuid())
+  user                 User     @relation(fields: [userId], references: [id])
+  userId               String   @unique
+  totalScore           Float    @default(0)   // 0-1000 final score
+  broadcastQuality     Float    @default(0)   // 0-100 AI-rated
+  engagementRate       Float    @default(0)   // 0-100 derived from views/impressions
+  consistency          Float    @default(0)   // 0-100 posting frequency
+  biometricLevel       Float    @default(0)   // 0-100 verification strength
+  crossAppActivity     Float    @default(0)   // 0-100 how many Quant apps used
+  communityStanding    Float    @default(0)   // 0-100 reports reduce this
+  lastCalculatedAt     DateTime @default(now())
+  lastActivityAt       DateTime @default(now())
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  history              ScoreHistory[]
+  challenges           InfluenceChallenge[]
+
+  @@index([totalScore(sort: Desc)])
+  @@index([userId])
+}
+
+model ScoreHistory {
+  id             String         @id @default(uuid())
+  influenceScore InfluenceScore @relation(fields: [influenceScoreId], references: [id])
+  influenceScoreId String
+  score          Float
+  broadcastQuality  Float       @default(0)
+  engagementRate    Float       @default(0)
+  consistency       Float       @default(0)
+  biometricLevel    Float       @default(0)
+  crossAppActivity  Float       @default(0)
+  communityStanding Float       @default(0)
+  snapshotDate   DateTime       // date-only (UTC midnight)
+  createdAt      DateTime       @default(now())
+
+  @@unique([influenceScoreId, snapshotDate])
+  @@index([influenceScoreId, snapshotDate(sort: Desc)])
+}
+
+model InfluenceChallenge {
+  id             String              @id @default(uuid())
+  influenceScore InfluenceScore      @relation(fields: [influenceScoreId], references: [id])
+  influenceScoreId String
+  challengeType  ChallengeType
+  status         ChallengeStatus     @default(ACTIVE)
+  boostPoints    Int                 @default(50)
+  startedAt      DateTime            @default(now())
+  expiresAt      DateTime
+  completedAt    DateTime?
+  createdAt      DateTime            @default(now())
+
+  @@index([influenceScoreId, status])
+  @@index([expiresAt])
+}
+
+enum ChallengeType {
+  DAILY_POST
+  ENGAGEMENT_SPIKE
+  CROSS_APP_VISIT
+  BIOMETRIC_REFRESH
+  COMMUNITY_VOUCH
+}
+
+enum ChallengeStatus {
+  ACTIVE
+  COMPLETED
+  EXPIRED
 }

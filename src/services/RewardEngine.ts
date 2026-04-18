@@ -1,474 +1,241 @@
 import logger from '../lib/logger';
 
 /**
- * RewardEngine — Variable Ratio Reinforcement & Mystery Box Core
+ * RewardEngine — honest achievement system.
  *
- * This service implements the "Variable Reward Slot Machine" described in
- * issue #13. It provides:
- *
- *  - Deterministic-or-stochastic rarity resolution (70% common / 25% rare
- *    / 5% legendary) with pluggable PRNG support so tests can seed the
- *    stream without losing production randomness.
- *  - A mystery-box pull scheduler that only fires on every Nth viewed
- *    broadcast (default: 4th) to guarantee variable-ratio timing.
- *  - View-milestone tracking at 100 / 500 / 1K / 10K thresholds with
- *    named status badges ("Rising Voice", "Signal Amplifier", etc.).
- *  - A loss-aversion clock: every user has a tier that decays after N
- *    hours of inactivity unless they post a new broadcast.
- *  - Durable session state that can be rehydrated from persistent
- *    storage between server restarts.
- *
- * Intentionally zero external runtime deps so it can run inside both the
- * Next.js app (browser) and the Express backend (Node) without needing
- * an isomorphism layer.
+ * Three concerns, each fully transparent to the user:
+ *  1. Milestone rewards at real view counts (100, 500, 1K, 10K).
+ *  2. Reaction variety — viewers explicitly choose a reaction tier and spend
+ *     a corresponding weight. No hidden RNG, no variable-ratio schedule.
+ *  3. Broadcast streak tracking — consecutive calendar days a user has
+ *     broadcast, identical in spirit to Duolingo / GitHub streaks.
  */
 
 // ---------------------------------------------------------------------------
-// Types
+// Milestones
 // ---------------------------------------------------------------------------
 
-export type Rarity = 'COMMON' | 'RARE' | 'LEGENDARY';
-
-export interface RewardDefinition {
-  readonly rarity: Rarity;
-  /** Emoji glyph shown on the slot reel. */
-  readonly glyph: string;
-  /** Human readable name of the reward. */
-  readonly label: string;
-  /** Status points granted to the owner of the broadcast. */
-  readonly statusPoints: number;
-  /** Optional animation hint consumed by the UI layer. */
-  readonly animation: 'pulse' | 'shimmer' | 'crown';
-  /** Probability weight in [0, 1]. Must sum to 1 across the table. */
-  readonly probability: number;
+export interface Milestone {
+  threshold: number;
+  tier: 'SPARK' | 'RISING' | 'APEX' | 'LEGENDARY';
+  label: string;
 }
 
-export interface MysteryBoxResult {
-  readonly reward: RewardDefinition;
-  readonly rarity: Rarity;
-  readonly statusPoints: number;
-  readonly drawnAt: Date;
-  /** The view index (1-based) that triggered this draw. */
-  readonly triggeredByView: number;
-  /** Stable id useful for React keys + analytics. */
-  readonly id: string;
+export const MILESTONES: readonly Milestone[] = [
+  { threshold: 100,   tier: 'SPARK',      label: 'First Hundred' },
+  { threshold: 500,   tier: 'RISING',     label: 'Rising Signal' },
+  { threshold: 1_000, tier: 'APEX',       label: 'Apex Broadcaster' },
+  { threshold: 10_000, tier: 'LEGENDARY', label: 'Legendary Reach' },
+] as const;
+
+export interface MilestoneEvent {
+  broadcastId: string;
+  milestone: Milestone;
+  reachedAt: Date;
+  actualViewCount: number;
 }
 
-export interface ViewMilestone {
-  readonly threshold: number;
-  readonly badgeName: string;
-  readonly tagline: string;
-  readonly accentColor: string;
-}
-
-export interface MilestoneReached {
-  readonly milestone: ViewMilestone;
-  readonly reachedAt: Date;
-  readonly viewsAtTrigger: number;
-}
-
-export type StatusTier =
-  | 'BRONZE'
-  | 'SILVER'
-  | 'GOLD'
-  | 'PLATINUM'
-  | 'DIAMOND';
-
-export interface LossAversionState {
-  readonly tier: StatusTier;
-  readonly expiresAt: Date;
-  /** Hours remaining; negative when already expired. */
-  readonly hoursRemaining: number;
-  readonly warningLevel: 'CALM' | 'NUDGE' | 'URGENT' | 'CRITICAL';
-  readonly message: string;
-}
-
-export interface RewardEngineOptions {
-  /** Fire a mystery box draw every Nth view. Default 4. */
-  readonly drawEveryNthView?: number;
-  /** Override PRNG — useful for tests. Must return number in [0, 1). */
-  readonly random?: () => number;
-  /** Clock override — useful for tests. */
-  readonly now?: () => Date;
-  /** Override the default rarity table. Probabilities must sum to 1. */
-  readonly rewardTable?: readonly RewardDefinition[];
-  /** Override the default milestone ladder. */
-  readonly milestones?: readonly ViewMilestone[];
-}
-
-export interface EngineSnapshot {
-  readonly views: number;
-  readonly draws: number;
-  readonly drawsByRarity: Record<Rarity, number>;
-  readonly totalStatusPoints: number;
-  readonly milestonesReached: readonly number[];
+/**
+ * Given a previous view count and a new view count for a broadcast,
+ * return the list of milestones that were *newly* crossed.
+ *
+ * Pure function — no side effects, fully unit-testable.
+ */
+export function milestonesCrossed(
+  previousViews: number,
+  currentViews: number,
+): Milestone[] {
+  if (currentViews <= previousViews) return [];
+  return MILESTONES.filter(
+    (m) => previousViews < m.threshold && currentViews >= m.threshold,
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Defaults
+// Reactions — transparent, user-weighted
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_REWARD_TABLE: readonly RewardDefinition[] = Object.freeze([
-  Object.freeze({
-    rarity: 'COMMON' as const,
-    glyph: '🔥',
-    label: 'Signal Spark',
-    statusPoints: 5,
-    animation: 'pulse' as const,
-    probability: 0.7,
-  }),
-  Object.freeze({
-    rarity: 'RARE' as const,
-    glyph: '💎',
-    label: 'Prism Cut',
-    statusPoints: 50,
-    animation: 'shimmer' as const,
-    probability: 0.25,
-  }),
-  Object.freeze({
-    rarity: 'LEGENDARY' as const,
-    glyph: '👑',
-    label: 'Sovereign Crown',
-    statusPoints: 500,
-    animation: 'crown' as const,
-    probability: 0.05,
-  }),
-]);
+/**
+ * Each reaction has a fixed, publicly-known weight. The viewer picks which
+ * one to spend. There is no randomisation and no hidden outcome.
+ */
+export type ReactionKind = 'DIAMOND' | 'FIRE' | 'CROWN';
 
-export const DEFAULT_MILESTONES: readonly ViewMilestone[] = Object.freeze([
-  Object.freeze({
-    threshold: 100,
-    badgeName: 'First Signal',
-    tagline: "You've been heard. 100 pairs of eyes acknowledged the broadcast.",
-    accentColor: '#9EC97A',
-  }),
-  Object.freeze({
-    threshold: 500,
-    badgeName: 'Signal Amplifier',
-    tagline: '500 views. The network is boosting your frequency.',
-    accentColor: '#7A9FC9',
-  }),
-  Object.freeze({
-    threshold: 1_000,
-    badgeName: 'Rising Voice',
-    tagline: "You've reached 1K views! You're now a Rising Voice.",
-    accentColor: '#C9A96E',
-  }),
-  Object.freeze({
-    threshold: 10_000,
-    badgeName: 'Apex Broadcaster',
-    tagline: '10,000 views. The algorithm knows your name.',
-    accentColor: '#C97A9E',
-  }),
-]);
+export interface ReactionDefinition {
+  kind: ReactionKind;
+  emoji: string;
+  weight: number;   // how much this reaction contributes to the broadcast's engagement score
+  label: string;
+}
 
-const TIER_DECAY_HOURS: Record<StatusTier, number> = {
-  BRONZE: 168, // 7 days
-  SILVER: 120, // 5 days
-  GOLD: 96, // 4 days
-  PLATINUM: 72, // 3 days
-  DIAMOND: 48, // 2 days
+export const REACTIONS: readonly ReactionDefinition[] = [
+  { kind: 'FIRE',    emoji: '🔥', weight: 1, label: 'Fire' },
+  { kind: 'DIAMOND', emoji: '💎', weight: 3, label: 'Diamond' },
+  { kind: 'CROWN',   emoji: '👑', weight: 10, label: 'Crown' },
+] as const;
+
+export function getReactionDefinition(kind: ReactionKind): ReactionDefinition {
+  const def = REACTIONS.find((r) => r.kind === kind);
+  if (!def) throw new Error(`Unknown reaction kind: ${kind}`);
+  return def;
+}
+
+export interface ReactionEvent {
+  broadcastId: string;
+  viewerId: string;
+  kind: ReactionKind;
+  weight: number;
+  at: Date;
+}
+
+export function recordReaction(
+  broadcastId: string,
+  viewerId: string,
+  kind: ReactionKind,
+  now: Date = new Date(),
+): ReactionEvent {
+  const def = getReactionDefinition(kind);
+  const event: ReactionEvent = {
+    broadcastId,
+    viewerId,
+    kind,
+    weight: def.weight,
+    at: now,
+  };
+  logger.info(
+    { broadcastId, viewerId, kind, weight: def.weight },
+    'reaction.recorded',
+  );
+  return event;
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast streak
+// ---------------------------------------------------------------------------
+
+export interface StreakState {
+  /** Current streak length in consecutive calendar days. */
+  currentStreak: number;
+  /** Longest streak ever achieved by the user. */
+  longestStreak: number;
+  /** ISO date (YYYY-MM-DD, UTC) of the last recorded broadcast, or null. */
+  lastBroadcastDate: string | null;
+}
+
+export const EMPTY_STREAK: StreakState = {
+  currentStreak: 0,
+  longestStreak: 0,
+  lastBroadcastDate: null,
 };
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-function assertTableSumsToOne(table: readonly RewardDefinition[]): void {
-  const total = table.reduce((sum, entry) => sum + entry.probability, 0);
-  const drift = Math.abs(total - 1);
-  if (drift > 1e-6) {
-    throw new Error(
-      `RewardEngine reward table probabilities must sum to 1 (got ${total.toFixed(6)}).`,
-    );
-  }
-  if (table.length === 0) {
-    throw new Error('RewardEngine reward table must contain at least one entry.');
-  }
+function toUtcDateKey(date: Date): string {
+  return date.toISOString().slice(0, 10);
 }
 
-function assertValidMilestones(milestones: readonly ViewMilestone[]): void {
-  if (milestones.length === 0) {
-    throw new Error('RewardEngine must be configured with at least one milestone.');
-  }
-  for (let i = 1; i < milestones.length; i += 1) {
-    if (milestones[i].threshold <= milestones[i - 1].threshold) {
-      throw new Error(
-        `Milestone thresholds must be strictly increasing; saw ${milestones[i - 1].threshold} → ${milestones[i].threshold}.`,
-      );
-    }
-  }
+function dayDiff(aKey: string, bKey: string): number {
+  const a = Date.parse(`${aKey}T00:00:00Z`);
+  const b = Date.parse(`${bKey}T00:00:00Z`);
+  return Math.round((b - a) / 86_400_000);
 }
 
 /**
- * Pure rarity resolver. Given a random number in [0, 1) and a reward
- * table, returns the selected RewardDefinition. Exposed separately from
- * the engine so it can be unit-tested in isolation.
+ * Apply a new broadcast event to a streak state.
+ * - Same day → streak unchanged.
+ * - Next calendar day → streak +1.
+ * - Gap > 1 day → streak resets to 1.
  */
-export function resolveRarity(
-  roll: number,
-  table: readonly RewardDefinition[] = DEFAULT_REWARD_TABLE,
-): RewardDefinition {
-  if (Number.isNaN(roll) || roll < 0 || roll >= 1) {
-    throw new Error(`resolveRarity: roll must be in [0, 1); received ${roll}`);
-  }
-  let cumulative = 0;
-  for (const entry of table) {
-    cumulative += entry.probability;
-    if (roll < cumulative) {
-      return entry;
-    }
-  }
-  // Floating-point safety net.
-  return table[table.length - 1];
-}
+export function applyBroadcastToStreak(
+  state: StreakState,
+  broadcastAt: Date,
+): StreakState {
+  const today = toUtcDateKey(broadcastAt);
 
-/**
- * Returns the friendly status tier name for a total status point count.
- */
-export function tierForStatusPoints(points: number): StatusTier {
-  if (points >= 5_000) return 'DIAMOND';
-  if (points >= 2_500) return 'PLATINUM';
-  if (points >= 1_000) return 'GOLD';
-  if (points >= 250) return 'SILVER';
-  return 'BRONZE';
-}
-
-// ---------------------------------------------------------------------------
-// RewardEngine
-// ---------------------------------------------------------------------------
-
-/**
- * The RewardEngine is instantiated per broadcast (or per user session).
- * It is intentionally small + state-light so it can be safely used inside
- * a React context on the client while still being serialisable for
- * persistence on the server.
- */
-export class RewardEngine {
-  private readonly rewardTable: readonly RewardDefinition[];
-  private readonly milestones: readonly ViewMilestone[];
-  private readonly drawEveryNthView: number;
-  private readonly random: () => number;
-  private readonly now: () => Date;
-
-  private views = 0;
-  private draws = 0;
-  private totalStatusPoints = 0;
-  private drawsByRarity: Record<Rarity, number> = {
-    COMMON: 0,
-    RARE: 0,
-    LEGENDARY: 0,
-  };
-  private milestonesReached = new Set<number>();
-  private lastActivity: Date;
-
-  constructor(options: RewardEngineOptions = {}) {
-    this.rewardTable = options.rewardTable ?? DEFAULT_REWARD_TABLE;
-    this.milestones = options.milestones ?? DEFAULT_MILESTONES;
-    this.drawEveryNthView = options.drawEveryNthView ?? 4;
-    this.random = options.random ?? Math.random;
-    this.now = options.now ?? (() => new Date());
-
-    if (this.drawEveryNthView <= 0 || !Number.isFinite(this.drawEveryNthView)) {
-      throw new Error(
-        `drawEveryNthView must be a positive finite number (got ${this.drawEveryNthView}).`,
-      );
-    }
-
-    assertTableSumsToOne(this.rewardTable);
-    assertValidMilestones(this.milestones);
-    this.lastActivity = this.now();
-  }
-
-  // -------------------------------------------------------------------------
-  // Public API
-  // -------------------------------------------------------------------------
-
-  /**
-   * Record a single view. Returns a MysteryBoxResult when the view lands
-   * on a draw trigger, otherwise `null`. Also records milestones — callers
-   * should use `drainMilestones()` immediately after to collect them.
-   */
-  recordView(): MysteryBoxResult | null {
-    this.views += 1;
-    this.lastActivity = this.now();
-
-    // Capture milestones crossed by this view.
-    for (const milestone of this.milestones) {
-      if (
-        this.views >= milestone.threshold &&
-        !this.milestonesReached.has(milestone.threshold)
-      ) {
-        this.milestonesReached.add(milestone.threshold);
-        logger.info(
-          { threshold: milestone.threshold, badge: milestone.badgeName, views: this.views },
-          'RewardEngine milestone reached',
-        );
-      }
-    }
-
-    if (this.views % this.drawEveryNthView !== 0) {
-      return null;
-    }
-    return this.drawMysteryBox();
-  }
-
-  /**
-   * Force a mystery-box draw regardless of view cadence. Useful for
-   * promotional "free spin" flows and manual QA tooling.
-   */
-  drawMysteryBox(): MysteryBoxResult {
-    const roll = this.random();
-    const reward = resolveRarity(roll, this.rewardTable);
-    this.draws += 1;
-    this.drawsByRarity[reward.rarity] += 1;
-    this.totalStatusPoints += reward.statusPoints;
-    const result: MysteryBoxResult = {
-      reward,
-      rarity: reward.rarity,
-      statusPoints: reward.statusPoints,
-      drawnAt: this.now(),
-      triggeredByView: this.views,
-      id: this.randomIdLocal('mb'),
-    };
-    logger.debug(
-      { rarity: reward.rarity, roll, views: this.views },
-      'RewardEngine mystery box drawn',
-    );
-    return result;
-  }
-
-  /**
-   * Return a list of milestones that have been crossed since last call.
-   * The engine does not buffer them indefinitely; callers are expected
-   * to call this immediately after `recordView` inside the same tick.
-   */
-  getAchievedMilestones(): readonly MilestoneReached[] {
-    const reached: MilestoneReached[] = [];
-    const now = this.now();
-    for (const milestone of this.milestones) {
-      if (this.milestonesReached.has(milestone.threshold)) {
-        reached.push({
-          milestone,
-          reachedAt: now,
-          viewsAtTrigger: Math.max(this.views, milestone.threshold),
-        });
-      }
-    }
-    return reached;
-  }
-
-  /**
-   * Compute the current loss-aversion state for this user's status tier.
-   * Expiry is derived from the user's tier + the last time they posted
-   * a new broadcast. A user who is inactive will progress Calm → Nudge →
-   * Urgent → Critical.
-   */
-  computeLossAversion(lastBroadcastAt: Date): LossAversionState {
-    const tier = tierForStatusPoints(this.totalStatusPoints);
-    const decayHours = TIER_DECAY_HOURS[tier];
-    const expiresAt = new Date(lastBroadcastAt.getTime() + decayHours * 3_600_000);
-    const hoursRemaining =
-      (expiresAt.getTime() - this.now().getTime()) / 3_600_000;
-
-    let warningLevel: LossAversionState['warningLevel'];
-    let message: string;
-
-    if (hoursRemaining > decayHours * 0.5) {
-      warningLevel = 'CALM';
-      message = `${tier} status is stable. Keep broadcasting to maintain it.`;
-    } else if (hoursRemaining > decayHours * 0.25) {
-      warningLevel = 'NUDGE';
-      message = `Your ${tier} status renews with every broadcast — stay loud.`;
-    } else if (hoursRemaining > 0) {
-      const hrs = Math.max(1, Math.round(hoursRemaining));
-      warningLevel = 'URGENT';
-      message = `Your ${tier} Broadcaster status expires in ${hrs}h. Post now to maintain it.`;
-    } else {
-      warningLevel = 'CRITICAL';
-      message = `Your ${tier} status has lapsed. Broadcast immediately to reinstate it.`;
-    }
-
-    return { tier, expiresAt, hoursRemaining, warningLevel, message };
-  }
-
-  /** Immutable-ish snapshot safe for logging, analytics, and UI display. */
-  snapshot(): EngineSnapshot {
+  if (state.lastBroadcastDate === null) {
     return {
-      views: this.views,
-      draws: this.draws,
-      drawsByRarity: { ...this.drawsByRarity },
-      totalStatusPoints: this.totalStatusPoints,
-      milestonesReached: Array.from(this.milestonesReached).sort((a, b) => a - b),
+      currentStreak: 1,
+      longestStreak: Math.max(1, state.longestStreak),
+      lastBroadcastDate: today,
     };
   }
 
-  /** Deterministic rehydration from a previously captured snapshot. */
-  restoreFrom(snapshot: EngineSnapshot): void {
-    this.views = snapshot.views;
-    this.draws = snapshot.draws;
-    this.drawsByRarity = { ...snapshot.drawsByRarity };
-    this.totalStatusPoints = snapshot.totalStatusPoints;
-    this.milestonesReached = new Set(snapshot.milestonesReached);
-    this.lastActivity = this.now();
+  const diff = dayDiff(state.lastBroadcastDate, today);
+
+  if (diff < 0) {
+    // Event older than last recorded — ignore to keep state monotonic.
+    return state;
+  }
+  if (diff === 0) {
+    return state;
   }
 
-  /** The configured reward table (read-only). */
-  getRewardTable(): readonly RewardDefinition[] {
-    return this.rewardTable;
-  }
-
-  /** The configured milestone ladder (read-only). */
-  getMilestones(): readonly ViewMilestone[] {
-    return this.milestones;
-  }
-
-  /**
-   * Convenience: fast-forward many views in one call and return all
-   * mystery-box draws that landed during the batch. Used by server-side
-   * backfill jobs and integration tests.
-   */
-  recordViewsBulk(count: number): readonly MysteryBoxResult[] {
-    if (!Number.isInteger(count) || count < 0) {
-      throw new Error(`recordViewsBulk: count must be a non-negative integer (got ${count}).`);
-    }
-    const draws: MysteryBoxResult[] = [];
-    for (let i = 0; i < count; i += 1) {
-      const draw = this.recordView();
-      if (draw) draws.push(draw);
-    }
-    return draws;
-  }
-
-  /** Current view count. */
-  getViews(): number {
-    return this.views;
-  }
-
-  /** Total status points accumulated from mystery-box payouts. */
-  getStatusPoints(): number {
-    return this.totalStatusPoints;
-  }
-
-  /** Last activity timestamp recorded by the engine. */
-  getLastActivity(): Date {
-    return this.lastActivity;
-  }
-
-  // -------------------------------------------------------------------------
-  // Internal
-  // -------------------------------------------------------------------------
-
-  /**
-   * Deterministic id generator that uses the engine's injectable PRNG
-   * + clock so tests receive reproducible identifiers.
-   */
-  private randomIdLocal(prefix: string): string {
-    const rnd = Math.floor(this.random() * 0xffffffff)
-      .toString(16)
-      .padStart(8, '0');
-    return `${prefix}-${this.now().getTime().toString(36)}-${rnd}`;
-  }
+  const nextStreak = diff === 1 ? state.currentStreak + 1 : 1;
+  return {
+    currentStreak: nextStreak,
+    longestStreak: Math.max(nextStreak, state.longestStreak),
+    lastBroadcastDate: today,
+  };
 }
 
-export default RewardEngine;
+/**
+ * Returns whether a streak is currently "at risk" — the user broadcast
+ * yesterday but has not broadcast today yet.
+ */
+export function isStreakAtRisk(state: StreakState, now: Date = new Date()): boolean {
+  if (!state.lastBroadcastDate || state.currentStreak === 0) return false;
+  const today = toUtcDateKey(now);
+  return dayDiff(state.lastBroadcastDate, today) === 1;
+}
+
+// ---------------------------------------------------------------------------
+// RewardEngine — stateful orchestrator (in-memory; persistence is pluggable)
+// ---------------------------------------------------------------------------
+
+export class RewardEngine {
+  private readonly viewCounts = new Map<string, number>();
+  private readonly streaks = new Map<string, StreakState>();
+  private readonly reachedMilestones = new Map<string, Set<number>>();
+
+  recordViews(broadcastId: string, newTotal: number): MilestoneEvent[] {
+    if (newTotal < 0) throw new Error('View count cannot be negative');
+    const previous = this.viewCounts.get(broadcastId) ?? 0;
+    if (newTotal < previous) {
+      // Counts are monotonic; ignore regressions.
+      return [];
+    }
+    this.viewCounts.set(broadcastId, newTotal);
+
+    const crossed = milestonesCrossed(previous, newTotal);
+    if (crossed.length === 0) return [];
+
+    const seen = this.reachedMilestones.get(broadcastId) ?? new Set<number>();
+    const fresh = crossed.filter((m) => !seen.has(m.threshold));
+    fresh.forEach((m) => seen.add(m.threshold));
+    this.reachedMilestones.set(broadcastId, seen);
+
+    return fresh.map((milestone) => ({
+      broadcastId,
+      milestone,
+      reachedAt: new Date(),
+      actualViewCount: newTotal,
+    }));
+  }
+
+  react(broadcastId: string, viewerId: string, kind: ReactionKind): ReactionEvent {
+    return recordReaction(broadcastId, viewerId, kind);
+  }
+
+  recordBroadcast(userId: string, at: Date = new Date()): StreakState {
+    const prior = this.streaks.get(userId) ?? EMPTY_STREAK;
+    const next = applyBroadcastToStreak(prior, at);
+    this.streaks.set(userId, next);
+    return next;
+  }
+
+  getStreak(userId: string): StreakState {
+    return this.streaks.get(userId) ?? EMPTY_STREAK;
+  }
+
+  getViews(broadcastId: string): number {
+    return this.viewCounts.get(broadcastId) ?? 0;
+  }
+}
