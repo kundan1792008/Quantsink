@@ -38,6 +38,8 @@ model User {
   following       Follow[]     @relation("FollowSource")
   dmsSent         DirectMessage[] @relation("DMSender")
   dmsReceived     DirectMessage[] @relation("DMReceiver")
+  broadcasts      Broadcast[]
+  influenceScore  InfluenceScore?
 
   @@index([quantmailId])
   @@index([email])
@@ -191,4 +193,112 @@ enum SpamAction {
   SHADOW_INBOX   // Moved to shadow inbox, visible only if user checks
   NEGOTIATED     // AI Twin replied to negotiate
   DROPPED        // Automatically discarded
+}
+
+// ---------------------------------------------------------------------------
+// Broadcasts — Quantsink Pro zero-reply broadcast posts
+// ---------------------------------------------------------------------------
+model Broadcast {
+  id                String    @id @default(uuid())
+  author            User      @relation(fields: [authorId], references: [id])
+  authorId          String
+  content           String    @db.Text
+  biometricHash     String
+  biometricVerified Boolean   @default(true)
+  viewCount         Int       @default(0)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  @@index([authorId])
+  @@index([createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Security Audit Log — tracks zero-reply protocol violations
+// ---------------------------------------------------------------------------
+model SecurityAuditLog {
+  id          String   @id @default(uuid())
+  attemptType String
+  ipAddress   String
+  userAgent   String
+  timestamp   DateTime @default(now())
+  blocked     Boolean  @default(true)
+
+  @@index([timestamp(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Influence Score — Social Credit system (0-1000)
+// ---------------------------------------------------------------------------
+
+model InfluenceScore {
+  id                   String   @id @default(uuid())
+  user                 User     @relation(fields: [userId], references: [id])
+  userId               String   @unique
+  totalScore           Float    @default(0)   // 0-1000 final score
+  broadcastQuality     Float    @default(0)   // 0-100 AI-rated
+  engagementRate       Float    @default(0)   // 0-100 derived from views/impressions
+  consistency          Float    @default(0)   // 0-100 posting frequency
+  biometricLevel       Float    @default(0)   // 0-100 verification strength
+  crossAppActivity     Float    @default(0)   // 0-100 how many Quant apps used
+  communityStanding    Float    @default(0)   // 0-100 reports reduce this
+  lastCalculatedAt     DateTime @default(now())
+  lastActivityAt       DateTime @default(now())
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  history              ScoreHistory[]
+  challenges           InfluenceChallenge[]
+
+  @@index([totalScore(sort: Desc)])
+  @@index([userId])
+}
+
+model ScoreHistory {
+  id             String         @id @default(uuid())
+  influenceScore InfluenceScore @relation(fields: [influenceScoreId], references: [id])
+  influenceScoreId String
+  score          Float
+  broadcastQuality  Float       @default(0)
+  engagementRate    Float       @default(0)
+  consistency       Float       @default(0)
+  biometricLevel    Float       @default(0)
+  crossAppActivity  Float       @default(0)
+  communityStanding Float       @default(0)
+  snapshotDate   DateTime       // date-only (UTC midnight)
+  createdAt      DateTime       @default(now())
+
+  @@unique([influenceScoreId, snapshotDate])
+  @@index([influenceScoreId, snapshotDate(sort: Desc)])
+}
+
+model InfluenceChallenge {
+  id             String              @id @default(uuid())
+  influenceScore InfluenceScore      @relation(fields: [influenceScoreId], references: [id])
+  influenceScoreId String
+  challengeType  ChallengeType
+  status         ChallengeStatus     @default(ACTIVE)
+  boostPoints    Int                 @default(50)
+  startedAt      DateTime            @default(now())
+  expiresAt      DateTime
+  completedAt    DateTime?
+  createdAt      DateTime            @default(now())
+
+  @@index([influenceScoreId, status])
+  @@index([expiresAt])
+}
+
+enum ChallengeType {
+  DAILY_POST
+  ENGAGEMENT_SPIKE
+  CROSS_APP_VISIT
+  BIOMETRIC_REFRESH
+  COMMUNITY_VOUCH
+}
+
+enum ChallengeStatus {
+  ACTIVE
+  COMPLETED
+  EXPIRED
 }

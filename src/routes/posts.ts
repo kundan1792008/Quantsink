@@ -2,6 +2,8 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { requireAuth } from '../middleware/auth';
+import { quantmailLiveness } from '../services/QuantmailLivenessService';
+import { pushBroadcast } from '../services/BroadcastWebSocket';
 
 const router = Router();
 
@@ -34,9 +36,48 @@ const FeedQuerySchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Zero-Reply guard — rejects any payload that carries reply / quote / interact
+// fields.  Applied to all mutating routes on this router.
+// ---------------------------------------------------------------------------
+const REPLY_FIELDS = ['replyTo', 'quotedPost', 'quoteId', 'interactionType', 'inReplyTo'];
+
+function zeroReplyGuard(req: Request, res: Response, next: NextFunction): void {
+  const forbidden = REPLY_FIELDS.filter((f) => f in (req.body ?? {}));
+  if (forbidden.length > 0) {
+    res.status(403).json({
+      error: 'ZERO_REPLY_VIOLATION',
+      message: 'Quantsink is a read-only broadcast zone. Replies, quotes, and interactions are not permitted.',
+      fields: forbidden,
+    });
+    return;
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Explicit 405 stubs for any attempt to use reply / quote / react endpoints.
+// These routes are listed here deliberately so that clients receive a clear
+// machine-readable rejection rather than a 404.
+// ---------------------------------------------------------------------------
+const rejectInteraction = (_req: Request, res: Response): void => {
+  res.status(405).json({
+    error: 'ZERO_REPLY_VIOLATION',
+    message: 'Quantsink is a read-only broadcast zone. Replies, quotes, and interactions are not permitted.',
+  });
+};
+
+router.post('/short/:id/reply',   requireAuth, rejectInteraction);
+router.post('/short/:id/quote',   requireAuth, rejectInteraction);
+router.post('/short/:id/react',   requireAuth, rejectInteraction);
+router.post('/deep/:id/reply',    requireAuth, rejectInteraction);
+router.post('/deep/:id/quote',    requireAuth, rejectInteraction);
+router.post('/deep/:id/react',    requireAuth, rejectInteraction);
+router.post('/interact',          requireAuth, rejectInteraction);
+
+// ---------------------------------------------------------------------------
 // POST /api/v1/posts/short
 // ---------------------------------------------------------------------------
-router.post('/short', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/short', requireAuth, zeroReplyGuard, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const parsed = CreateShortPostSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -46,6 +87,13 @@ router.post('/short', requireAuth, async (req: Request, res: Response, next: Nex
 
     const { content, mediaUrls, hashtags } = parsed.data;
     const userId = req.user!.sub;
+
+    // Biometric pre-flight: confirm liveness with Quantmail before publishing.
+    const isLive = await quantmailLiveness.checkLiveness(userId);
+    if (!isLive) {
+      res.status(403).json({ error: 'Biometric liveness check failed. Broadcast rejected.' });
+      return;
+    }
 
     // Upsert the user record (first call after Quantmail SSO)
     await prisma.user.upsert({
@@ -64,6 +112,16 @@ router.post('/short', requireAuth, async (req: Request, res: Response, next: Nex
       data: { authorId: user.id, content, mediaUrls, hashtags },
     });
 
+    // Real-time push: broadcast new post to all connected WebSocket clients.
+    pushBroadcast({
+      id:                  post.id,
+      content:             post.content,
+      authorId:            user.id,
+      authorDisplayName:   user.displayName,
+      biometricVerified:   true,
+      createdAt:           post.createdAt.toISOString(),
+    });
+
     res.status(201).json({ post });
   } catch (err) {
     next(err);
@@ -73,7 +131,7 @@ router.post('/short', requireAuth, async (req: Request, res: Response, next: Nex
 // ---------------------------------------------------------------------------
 // POST /api/v1/posts/deep
 // ---------------------------------------------------------------------------
-router.post('/deep', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/deep', requireAuth, zeroReplyGuard, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const parsed = CreateDeepPostSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -83,6 +141,13 @@ router.post('/deep', requireAuth, async (req: Request, res: Response, next: Next
 
     const { title, summary, content, coverImageUrl, tags, readTimeMin, isPublished } = parsed.data;
     const userId = req.user!.sub;
+
+    // Biometric pre-flight: confirm liveness with Quantmail before publishing.
+    const isLive = await quantmailLiveness.checkLiveness(userId);
+    if (!isLive) {
+      res.status(403).json({ error: 'Biometric liveness check failed. Broadcast rejected.' });
+      return;
+    }
 
     await prisma.user.upsert({
       where:  { quantmailId: userId },
@@ -108,6 +173,16 @@ router.post('/deep', requireAuth, async (req: Request, res: Response, next: Next
         isPublished,
         publishedAt:   isPublished ? new Date() : null,
       },
+    });
+
+    // Real-time push: broadcast new post to all connected WebSocket clients.
+    pushBroadcast({
+      id:                  post.id,
+      content:             post.title,
+      authorId:            user.id,
+      authorDisplayName:   user.displayName,
+      biometricVerified:   true,
+      createdAt:           post.createdAt.toISOString(),
     });
 
     res.status(201).json({ post });

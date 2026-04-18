@@ -30,6 +30,7 @@
     "pino-http": "^10.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "ws": "^8.20.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
@@ -40,6 +41,7 @@
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@types/supertest": "^6.0.2",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^7.13.0",
     "@typescript-eslint/parser": "^7.13.0",
     "autoprefixer": "^10.4.19",
