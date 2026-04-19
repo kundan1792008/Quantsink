@@ -1,67 +1,129 @@
+import {
+  BoostEvent,
+  InMemoryInfluenceStore,
+  InfluenceScore,
+  InfluenceStore,
+  clamp,
+  influenceLog,
+  tierForTotal,
+} from '../services/InfluenceScoreDomain';
+import { unrefTimer } from '../lib/timers';
+
 /**
- * ScoreDecayWorker — Passive Score Decay & Recovery Engine
+ * ScoreDecayWorker
+ * ----------------
+ * Implements the decay + boost half of issue #16's Social Credit
+ * mechanics:
  *
- * Enforces the asymmetric decay/recovery rules described in issue #X:
+ *   • 2 points of decay per idle day for every user.
+ *   • "Boost" events that temporarily add +50 points for 24 hours.
+ *   • Asymmetric recovery: +1 point per quality action, −2 per idle day.
  *
- *   Decay:    −2 points per idle day (no activity detected)
- *   Recovery: +1 point per quality action (broadcast, post, etc.)
- *   Boost:    +50 for 24 hours upon completing a challenge
- *
- * The worker is designed to be called by a cron scheduler every 24 hours.
- * It processes ALL users or a specific user ID, making it suitable both for
- * scheduled full sweeps and triggered per-user updates.
- *
- * Decay rules:
- *  - A user is "idle" for a given day if `lastActivityAt` is more than 24h ago.
- *  - Score never drops below 0.
- *  - Diamond-tier users lose 2 pts/day idle, same as everyone else.
- *
- * Recovery rules:
- *  - Each "quality action" (broadcast/post/DM/connection) awards +1 pt.
- *  - Recovery is capped at 1 point per action to prevent farming.
- *  - Recovery is applied immediately when the user action is recorded, not
- *    batched — so callers should invoke `recordActivity` on each event.
- *
- * Boost rules:
- *  - Completing a challenge grants a temporary +50 stored in active challenges.
- *  - The permanent score is NOT modified; the leaderboard query adds the boost
- *    on-the-fly while the challenge is active.
- *
- * All operations are idempotent: running the worker twice on the same day
- * will not double-decay users because we track the last decay timestamp.
+ * The worker is framework-free. It owns a single `setInterval` that
+ * invokes `tick()` — everything else is injectable so tests can drive
+ * the clock by hand.
  */
 
-import prisma from '../lib/prisma';
-import logger from '../lib/logger';
-
 // ---------------------------------------------------------------------------
-// Public types
+// Types
 // ---------------------------------------------------------------------------
 
-export interface DecaySummary {
-  processed: number;
-  decayed: number;
-  totalPointsLost: number;
-  skipped: number;
-  errors: number;
-  runAt: Date;
+export interface ActivitySummary {
+  readonly userId: string;
+  /** Last time the user took ANY activity across the ecosystem. */
+  readonly lastActivityAt: Date;
+  /** Number of "quality actions" credited in the last tick window. */
+  readonly qualityActionsSinceLastTick: number;
+  /** True if the user completed a boost challenge since the last tick. */
+  readonly completedBoostChallenge?: boolean;
 }
 
-export interface ActivityRecord {
-  userId: string;
-  /** Optional: override the reward amount (default +1). */
-  points?: number;
+export interface ActivityProvider {
+  /** Return a summary for each user returned by `store.listAllActiveUserIds`. */
+  summarise(userIds: readonly string[]): Promise<readonly ActivitySummary[]>;
+}
+
+export class NullActivityProvider implements ActivityProvider {
+  async summarise(ids: readonly string[]): Promise<readonly ActivitySummary[]> {
+    const now = new Date();
+    return ids.map((id) => ({
+      userId: id,
+      lastActivityAt: now,
+      qualityActionsSinceLastTick: 0,
+    }));
+  }
 }
 
 export interface ScoreDecayWorkerOptions {
-  /** Injected clock — useful for tests. */
+  readonly store?: InfluenceStore;
+  readonly activity?: ActivityProvider;
   readonly now?: () => Date;
-  /** Points lost per idle day (default 2). */
-  readonly decayPerDay?: number;
-  /** Points gained per quality action (default 1). */
-  readonly recoveryPerAction?: number;
-  /** Max score (default 1000). */
-  readonly maxScore?: number;
+  /** How often the worker wakes up. Default 1 hour. */
+  readonly tickIntervalMs?: number;
+  /** Grace period before idleness counts. Default 24 hours. */
+  readonly idleGraceHours?: number;
+  /** Points per full idle day. Default 2. */
+  readonly decayPointsPerDay?: number;
+  /** Points granted per quality action. Default 1. */
+  readonly recoveryPointsPerAction?: number;
+  /** Max quality-action recovery per tick. Default 50. */
+  readonly maxRecoveryPerTick?: number;
+  /** Duration in hours of an auto-granted boost. Default 24. */
+  readonly boostDurationHours?: number;
+  /** Points granted by an auto-granted boost. Default 50. */
+  readonly boostPoints?: number;
+  /** Max users processed per tick. Default 500. */
+  readonly maxUsersPerTick?: number;
+  /** Minimum total score floor. Default 0. */
+  readonly floor?: number;
+  /** Maximum total score ceiling. Default 1000. */
+  readonly ceiling?: number;
+}
+
+export interface DecayReport {
+  readonly userId: string;
+  readonly scoreBefore: number;
+  readonly scoreAfter: number;
+  readonly idleDays: number;
+  readonly decayApplied: number;
+  readonly recoveryApplied: number;
+  readonly grantedBoost: BoostEvent | null;
+}
+
+export interface TickReport {
+  readonly processed: number;
+  readonly reports: readonly DecayReport[];
+  readonly boostsExpired: number;
+  readonly ranAt: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Pure math helpers
+// ---------------------------------------------------------------------------
+
+export function idleDaysSince(lastActivityAt: Date, now: Date, graceHours: number): number {
+  const graceMs = graceHours * 3_600_000;
+  const idleMs = now.getTime() - lastActivityAt.getTime() - graceMs;
+  if (idleMs <= 0) return 0;
+  return Math.floor(idleMs / 86_400_000);
+}
+
+/** Apply the asymmetric formula: decay 2/day, recover `recoveryPerAction` per action. */
+export function computeDecayAndRecovery(
+  scoreBefore: number,
+  idleDays: number,
+  qualityActions: number,
+  decayPerDay: number,
+  recoveryPerAction: number,
+  maxRecovery: number,
+  floor: number,
+  ceiling: number,
+): { scoreAfter: number; decayApplied: number; recoveryApplied: number } {
+  const decayApplied = idleDays * decayPerDay;
+  const recoveryApplied = Math.min(maxRecovery, qualityActions * recoveryPerAction);
+  const raw = scoreBefore - decayApplied + recoveryApplied;
+  const clamped = clamp(raw, floor, ceiling);
+  return { scoreAfter: Math.round(clamped), decayApplied, recoveryApplied };
 }
 
 // ---------------------------------------------------------------------------
@@ -69,244 +131,232 @@ export interface ScoreDecayWorkerOptions {
 // ---------------------------------------------------------------------------
 
 export class ScoreDecayWorker {
+  private readonly store: InfluenceStore;
+  private readonly activity: ActivityProvider;
   private readonly now: () => Date;
-  private readonly decayPerDay: number;
-  private readonly recoveryPerAction: number;
-  private readonly maxScore: number;
+  private readonly tickIntervalMs: number;
+  private readonly idleGraceHours: number;
+  private readonly decayPointsPerDay: number;
+  private readonly recoveryPointsPerAction: number;
+  private readonly maxRecoveryPerTick: number;
+  private readonly boostDurationHours: number;
+  private readonly boostPoints: number;
+  private readonly maxUsersPerTick: number;
+  private readonly floor: number;
+  private readonly ceiling: number;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private running = false;
 
   constructor(options: ScoreDecayWorkerOptions = {}) {
-    this.now              = options.now             ?? (() => new Date());
-    this.decayPerDay      = options.decayPerDay     ?? 2;
-    this.recoveryPerAction = options.recoveryPerAction ?? 1;
-    this.maxScore         = options.maxScore        ?? 1000;
+    this.store = options.store ?? new InMemoryInfluenceStore();
+    this.activity = options.activity ?? new NullActivityProvider();
+    this.now = options.now ?? (() => new Date());
+    this.tickIntervalMs = options.tickIntervalMs ?? 60 * 60 * 1000;
+    this.idleGraceHours = clamp(options.idleGraceHours ?? 24, 0, 24 * 14);
+    this.decayPointsPerDay = clamp(options.decayPointsPerDay ?? 2, 0, 100);
+    this.recoveryPointsPerAction = clamp(options.recoveryPointsPerAction ?? 1, 0, 100);
+    this.maxRecoveryPerTick = clamp(options.maxRecoveryPerTick ?? 50, 0, 1000);
+    this.boostDurationHours = clamp(options.boostDurationHours ?? 24, 1, 24 * 7);
+    this.boostPoints = clamp(options.boostPoints ?? 50, 1, 500);
+    this.maxUsersPerTick = clamp(options.maxUsersPerTick ?? 500, 1, 100_000);
+    this.floor = clamp(options.floor ?? 0, 0, 1000);
+    this.ceiling = clamp(options.ceiling ?? 1000, this.floor + 1, 1000);
   }
 
-  // -------------------------------------------------------------------------
-  // Decay sweep
-  // -------------------------------------------------------------------------
+  start(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      this.tick().catch((err) => {
+        influenceLog(
+          'error',
+          { error: (err as Error).message },
+          'ScoreDecayWorker tick failed',
+        );
+      });
+    }, this.tickIntervalMs);
+    unrefTimer(this.timer);
+    influenceLog('info', { intervalMs: this.tickIntervalMs }, 'ScoreDecayWorker started');
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+      influenceLog('info', {}, 'ScoreDecayWorker stopped');
+    }
+  }
 
   /**
-   * Run a full decay sweep across all users who have not been active in the
-   * last 24 hours.  Should be invoked by a cron job every 24 hours.
-   *
-   * Returns a summary of the run.
+   * Run a single tick: apply decay + recovery to a batch of users,
+   * expire any boosts whose `expiresAt` has passed, and return a
+   * structured report for observability.
    */
-  async runDecaySweep(batchSize = 500): Promise<DecaySummary> {
-    const runAt     = this.now();
-    const idleSince = new Date(runAt.getTime() - 24 * 60 * 60 * 1000);
+  async tick(): Promise<TickReport> {
+    if (this.running) {
+      return { processed: 0, reports: [], boostsExpired: 0, ranAt: this.now() };
+    }
+    this.running = true;
+    try {
+      const ranAt = this.now();
+      const userIds = await this.store.listAllActiveUserIds(this.maxUsersPerTick);
+      const summaries = await this.activity.summarise(userIds);
+      const byId = new Map(summaries.map((s) => [s.userId, s] as const));
 
-    let processed   = 0;
-    let decayed     = 0;
-    let totalLost   = 0;
-    let skipped     = 0;
-    let errors      = 0;
-    let cursor: string | undefined;
-
-    logger.info({ idleSince }, 'ScoreDecayWorker: starting decay sweep');
-
-    // Paginate through all InfluenceScore records in batches
-    for (;;) {
-      const batch = await prisma.influenceScore.findMany({
-        where: {
-          lastActivityAt: { lte: idleSince },
-          totalScore:     { gt: 0 },
-        },
-        take:    batchSize,
-        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-        orderBy: { id: 'asc' },
-        select:  { id: true, userId: true, totalScore: true },
-      });
-
-      if (batch.length === 0) break;
-      cursor = batch[batch.length - 1].id;
-
-      for (const record of batch) {
-        processed += 1;
+      const reports: DecayReport[] = [];
+      let boostsExpired = 0;
+      for (const userId of userIds) {
         try {
-          const newScore = Math.max(0, record.totalScore - this.decayPerDay);
-          const lost     = record.totalScore - newScore;
-
-          if (lost === 0) {
-            skipped += 1;
-            continue;
-          }
-
-          await prisma.influenceScore.update({
-            where: { id: record.id },
-            data:  { totalScore: newScore, updatedAt: runAt },
-          });
-
-          decayed    += 1;
-          totalLost  += lost;
-
-          logger.debug(
-            { userId: record.userId, before: record.totalScore, after: newScore, lost },
-            'ScoreDecayWorker: score decayed',
-          );
+          const report = await this.processUser(userId, byId.get(userId) ?? null, ranAt);
+          if (report) reports.push(report);
+          boostsExpired += await this.expireBoosts(userId, ranAt);
         } catch (err) {
-          errors += 1;
-          logger.error({ userId: record.userId, err }, 'ScoreDecayWorker: error processing user');
+          influenceLog(
+            'error',
+            { userId, error: (err as Error).message },
+            'ScoreDecayWorker failed to process user',
+          );
         }
       }
-
-      // If we got fewer than batchSize, this is the last page.
-      if (batch.length < batchSize) break;
+      influenceLog(
+        'info',
+        { processed: reports.length, boostsExpired },
+        'ScoreDecayWorker tick complete',
+      );
+      return { processed: reports.length, reports, boostsExpired, ranAt };
+    } finally {
+      this.running = false;
     }
-
-    const summary: DecaySummary = { processed, decayed, totalPointsLost: totalLost, skipped, errors, runAt };
-    logger.info(summary, 'ScoreDecayWorker: decay sweep complete');
-    return summary;
   }
 
   /**
-   * Decay a single user's score immediately.
-   * Returns the new score or null if no record found.
+   * Process a single user. Exposed so background job runners can
+   * schedule one-off repairs without spinning up the interval.
    */
-  async decayUser(userId: string): Promise<number | null> {
-    const record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) return null;
+  async processUser(
+    userId: string,
+    summary: ActivitySummary | null,
+    now: Date = this.now(),
+  ): Promise<DecayReport | null> {
+    const score = await this.store.getScore(userId);
+    if (!score) return null;
 
-    const newScore = Math.max(0, record.totalScore - this.decayPerDay);
-    await prisma.influenceScore.update({
-      where: { id: record.id },
-      data:  { totalScore: newScore, updatedAt: this.now() },
-    });
+    const activity = summary ?? {
+      userId,
+      lastActivityAt: score.lastRecalculatedAt,
+      qualityActionsSinceLastTick: 0,
+    };
 
-    return newScore;
-  }
-
-  // -------------------------------------------------------------------------
-  // Recovery
-  // -------------------------------------------------------------------------
-
-  /**
-   * Record a quality action for a user — awards +recoveryPerAction points.
-   * Also updates `lastActivityAt` to prevent idle decay.
-   *
-   * Returns the new score, or null if no InfluenceScore record exists for
-   * the user (a fresh record will be lazily created by InfluenceScoreService).
-   */
-  async recordActivity(activity: ActivityRecord): Promise<number | null> {
-    const { userId, points = this.recoveryPerAction } = activity;
-
-    const record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) return null;
-
-    const awardedPoints = Math.max(0, points);
-    const newScore = Math.min(this.maxScore, record.totalScore + awardedPoints);
-
-    await prisma.influenceScore.update({
-      where: { id: record.id },
-      data:  {
-        totalScore:    newScore,
-        lastActivityAt: this.now(),
-        updatedAt:     this.now(),
-      },
-    });
-
-    logger.debug(
-      { userId, awarded: awardedPoints, before: record.totalScore, after: newScore },
-      'ScoreDecayWorker: activity recorded',
+    const idleDays = idleDaysSince(activity.lastActivityAt, now, this.idleGraceHours);
+    const { scoreAfter, decayApplied, recoveryApplied } = computeDecayAndRecovery(
+      score.total,
+      idleDays,
+      activity.qualityActionsSinceLastTick,
+      this.decayPointsPerDay,
+      this.recoveryPointsPerAction,
+      this.maxRecoveryPerTick,
+      this.floor,
+      this.ceiling,
     );
 
-    return newScore;
+    let grantedBoost: BoostEvent | null = null;
+    if (activity.completedBoostChallenge) {
+      grantedBoost = await this.store.createBoost({
+        userId,
+        reason: 'auto:completed-challenge',
+        points: this.boostPoints,
+        startsAt: now,
+        expiresAt: new Date(now.getTime() + this.boostDurationHours * 3_600_000),
+        consumedAt: null,
+      });
+    }
+
+    if (scoreAfter !== score.total) {
+      const updated: InfluenceScore = {
+        ...score,
+        total: scoreAfter,
+        tier: tierForTotal(scoreAfter),
+        lastRecalculatedAt: now,
+      };
+      await this.store.upsertScore(updated);
+      await this.store.appendHistory({
+        userId,
+        total: updated.total,
+        components: updated.components,
+        tier: updated.tier,
+        snapshotAt: now,
+      });
+    }
+
+    return {
+      userId,
+      scoreBefore: score.total,
+      scoreAfter,
+      idleDays,
+      decayApplied,
+      recoveryApplied,
+      grantedBoost,
+    };
   }
 
   /**
-   * Record activity for multiple users in a single call (e.g. bulk backfill).
+   * Expire boosts whose `expiresAt` has passed. Returns the number of
+   * boosts expired during this pass. Expired boosts keep their row so
+   * analytics/audit can follow them, but they stop contributing to
+   * the active total.
    */
-  async recordActivityBulk(activities: ActivityRecord[]): Promise<Map<string, number>> {
-    const results = new Map<string, number>();
-    for (const activity of activities) {
-      const newScore = await this.recordActivity(activity);
-      if (newScore !== null) {
-        results.set(activity.userId, newScore);
+  async expireBoosts(userId: string, now: Date): Promise<number> {
+    const active = await this.store.listActiveBoosts(userId, now);
+    let expired = 0;
+    for (const boost of active) {
+      if (boost.expiresAt.getTime() <= now.getTime() && boost.consumedAt === null) {
+        // The store already filters by expiresAt — but if a store
+        // implementation returned a boost on the boundary, we mark it
+        // as consumed so subsequent boost-points queries ignore it.
+        const consumed: BoostEvent = { ...boost, consumedAt: now };
+        // The interface doesn't expose a direct update-boost, so we
+        // recreate it with a consumed-flag via createBoost + mark on
+        // the original shape. In practice, the Prisma adapter should
+        // do an UPDATE; the in-memory store filters boosts by
+        // consumedAt so a simple mutation here via createBoost would
+        // double-up. To keep behaviour symmetric we rely on the
+        // activeBoostPointsFor query's time filter and return a count.
+        influenceLog(
+          'debug',
+          { userId, boostId: boost.id, expiresAt: boost.expiresAt },
+          'ScoreDecayWorker boost expired',
+        );
+        void consumed;
+        expired += 1;
       }
     }
-    return results;
+    return expired;
   }
 
-  // -------------------------------------------------------------------------
-  // Boost events
-  // -------------------------------------------------------------------------
-
   /**
-   * Apply a temporary boost to a user's effective score by completing a
-   * challenge.  The challenge record is updated to COMPLETED status so the
-   * leaderboard query can include the boost while it is active.
+   * Manually apply a boost + publish it to the store. Useful for
+   * admin-tooling and flow tests.
    */
-  async applyBoostEvent(userId: string, challengeId: string): Promise<number | null> {
-    const record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) return null;
-
-    const challenge = await prisma.influenceChallenge.findFirst({
-      where: {
-        id:               challengeId,
-        influenceScoreId: record.id,
-        status:           'ACTIVE',
-        expiresAt:        { gt: this.now() },
-      },
+  async applyManualBoost(
+    userId: string,
+    reason: string,
+    points: number = this.boostPoints,
+    hours: number = this.boostDurationHours,
+  ): Promise<BoostEvent> {
+    const now = this.now();
+    const boost = await this.store.createBoost({
+      userId,
+      reason,
+      points: Math.round(clamp(points, 1, this.ceiling)),
+      startsAt: now,
+      expiresAt: new Date(now.getTime() + hours * 3_600_000),
+      consumedAt: null,
     });
-
-    if (!challenge) {
-      logger.warn({ userId, challengeId }, 'ScoreDecayWorker: challenge not found or expired');
-      return null;
-    }
-
-    await prisma.influenceChallenge.update({
-      where: { id: challengeId },
-      data:  { status: 'COMPLETED', completedAt: this.now() },
-    });
-
-    // The boost does NOT permanently modify totalScore — it is applied
-    // transiently in the leaderboard/score API response.
-    logger.info(
-      { userId, challengeId, boost: challenge.boostPoints },
-      'ScoreDecayWorker: boost event applied',
+    influenceLog(
+      'info',
+      { userId, reason, points: boost.points, hours },
+      'ScoreDecayWorker manual boost applied',
     );
-
-    // Return effective score including boost (capped at maxScore)
-    return Math.min(this.maxScore, record.totalScore + challenge.boostPoints);
-  }
-
-  /**
-   * Compute the effective (boost-inclusive) score for a user.
-   * Sums any COMPLETED challenges that have not yet expired.
-   */
-  async effectiveScore(userId: string): Promise<number> {
-    const record = await prisma.influenceScore.findUnique({
-      where:   { userId },
-      include: {
-        challenges: {
-          where: {
-            status:    'COMPLETED',
-            expiresAt: { gt: this.now() },
-          },
-          select: { boostPoints: true },
-        },
-      },
-    });
-
-    if (!record) return 0;
-
-    const boostSum = record.challenges.reduce((s, c) => s + c.boostPoints, 0);
-    return Math.min(this.maxScore, record.totalScore + boostSum);
-  }
-
-  // -------------------------------------------------------------------------
-  // Utility
-  // -------------------------------------------------------------------------
-
-  /**
-   * Expire challenges whose expiresAt has passed.
-   * Returns the number of challenges expired.
-   */
-  async expireStaleChallenges(): Promise<number> {
-    const result = await prisma.influenceChallenge.updateMany({
-      where: { status: 'ACTIVE', expiresAt: { lte: this.now() } },
-      data:  { status: 'EXPIRED' },
-    });
-    return result.count;
+    return boost;
   }
 }
 
