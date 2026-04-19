@@ -1,372 +1,468 @@
 import {
-  NotificationAggregator,
   InMemoryNotificationStore,
-  NotificationRateLimiter,
-  DeduplicationCache,
-  APP_EVENT_MAP,
+  NotificationAggregator,
+  RawBusEvent,
+  SlidingWindowRateLimiter,
+  BusSocket,
+  BusSocketFactory,
+  UnifiedNotification,
 } from '../services/NotificationAggregator';
-import type { RawNotificationEvent, QuantApp } from '../services/NotificationAggregator';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-let idSeq = 0;
+class FakeClock {
+  constructor(public ms = 0) {}
+  now = (): number => this.ms;
+  advance(by: number): void { this.ms += by; }
+}
 
-function makeEvent(
-  overrides: Partial<RawNotificationEvent> = {},
-): RawNotificationEvent {
-  idSeq += 1;
+interface FakeTimerHandle { id: number; run: () => void; at: number }
+
+class FakeTimers {
+  private nextId = 1;
+  private readonly handles = new Map<number, FakeTimerHandle>();
+  constructor(private readonly clock: FakeClock) {}
+
+  setTimeout = (cb: () => void, ms: number): number => {
+    const id = this.nextId++;
+    this.handles.set(id, { id, run: cb, at: this.clock.now() + ms });
+    return id;
+  };
+  clearTimeout = (handle: unknown): void => {
+    this.handles.delete(handle as number);
+  };
+  setInterval = (cb: () => void, _ms: number): number => {
+    const id = this.nextId++;
+    this.handles.set(id, { id, run: cb, at: Infinity });
+    return id;
+  };
+  clearInterval = (handle: unknown): void => {
+    this.handles.delete(handle as number);
+  };
+
+  runPending(): void {
+    for (const h of Array.from(this.handles.values())) {
+      if (h.at <= this.clock.now()) {
+        this.handles.delete(h.id);
+        h.run();
+      }
+    }
+  }
+}
+
+function makeFakeSocket(): { socket: BusSocket; factory: BusSocketFactory; trigger: {
+  open: () => void;
+  message: (raw: string) => void;
+  close: (code?: number, reason?: string) => void;
+  error: (err: Error) => void;
+}; sent: string[] } {
+  const sent: string[] = [];
+  const hooks = {
+    open: (): void => undefined,
+    message: (_: string): void => undefined,
+    close: (_c?: number, _r?: string): void => undefined,
+    error: (_e: Error): void => undefined,
+  };
+  const socket: BusSocket = {
+    url: 'ws://test.bus',
+    send: (data) => { sent.push(data); },
+    close: () => { /* no-op */ },
+    onOpen: (cb) => { hooks.open = cb; },
+    onMessage: (cb) => { hooks.message = cb; },
+    onClose: (cb) => { hooks.close = cb; },
+    onError: (cb) => { hooks.error = cb; },
+  };
+  const factory: BusSocketFactory = () => socket;
   return {
-    eventId: `evt-${idSeq}`,
+    socket,
+    factory,
+    sent,
+    trigger: {
+      open: () => hooks.open(),
+      message: (raw) => hooks.message(raw),
+      close: (c, r) => hooks.close(c, r),
+      error: (e) => hooks.error(e),
+    },
+  };
+}
+
+function makeEvent(overrides: Partial<RawBusEvent> = {}): RawBusEvent {
+  return {
+    id: 'evt-1',
+    dedupeKey: 'dk-1',
     app: 'quantchat',
-    type: 'message',
-    title: `Test notification ${idSeq}`,
-    occurredAt: new Date().toISOString(),
+    kind: 'message',
+    title: 'Hello',
+    body: 'Hi there',
+    occurredAt: new Date(0).toISOString(),
+    senderId: 'u-1',
+    senderName: 'Ada',
     ...overrides,
   };
 }
+
+function makeAggregator(opts: {
+  clock?: FakeClock;
+  timers?: FakeTimers;
+  socketFactory?: BusSocketFactory;
+  maxPerMinute?: number;
+} = {}) {
+  const clock = opts.clock ?? new FakeClock();
+  const timers = opts.timers ?? new FakeTimers(clock);
+  const factory = opts.socketFactory ?? makeFakeSocket().factory;
+  let counter = 0;
+  const aggregator = new NotificationAggregator({
+    busUrl: 'ws://test.bus',
+    clock,
+    timers,
+    socketFactory: factory,
+    idGenerator: () => `gen-${++counter}`,
+    maxPerMinute: opts.maxPerMinute ?? 20,
+  });
+  return { aggregator, clock, timers };
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiter
+// ---------------------------------------------------------------------------
+
+describe('SlidingWindowRateLimiter', () => {
+  it('admits up to capacity then denies', () => {
+    const clock = new FakeClock();
+    const l = new SlidingWindowRateLimiter(3, 1000, clock);
+    expect(l.tryAdmit()).toBe(true);
+    expect(l.tryAdmit()).toBe(true);
+    expect(l.tryAdmit()).toBe(true);
+    expect(l.tryAdmit()).toBe(false);
+    expect(l.remaining()).toBe(0);
+  });
+
+  it('frees a slot when the window rolls forward', () => {
+    const clock = new FakeClock();
+    const l = new SlidingWindowRateLimiter(2, 1000, clock);
+    l.tryAdmit(); l.tryAdmit();
+    expect(l.tryAdmit()).toBe(false);
+    clock.advance(1001);
+    expect(l.tryAdmit()).toBe(true);
+  });
+
+  it('computes timeUntilSlotMs correctly', () => {
+    const clock = new FakeClock();
+    const l = new SlidingWindowRateLimiter(1, 1000, clock);
+    l.tryAdmit();
+    expect(l.timeUntilSlotMs()).toBe(1000);
+    clock.advance(300);
+    expect(l.timeUntilSlotMs()).toBe(700);
+  });
+
+  it('validates constructor arguments', () => {
+    expect(() => new SlidingWindowRateLimiter(0, 1000)).toThrow();
+    expect(() => new SlidingWindowRateLimiter(1, 0)).toThrow();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // InMemoryNotificationStore
 // ---------------------------------------------------------------------------
 
 describe('InMemoryNotificationStore', () => {
-  it('stores and retrieves notifications', async () => {
-    const store = new InMemoryNotificationStore();
-    const n = {
-      id: 1,
-      eventId: 'e1',
-      app: 'quantsink' as QuantApp,
-      type: 'broadcast' as const,
-      title: 'Hello',
-      occurredAt: new Date().toISOString(),
-      receivedAt: new Date().toISOString(),
-      read: false,
-      priorityScore: 5,
-    };
-    await store.put(n);
-    const all = await store.getAll();
-    expect(all).toHaveLength(1);
-    expect(all[0].title).toBe('Hello');
+  const make = (id: string, overrides: Partial<UnifiedNotification> = {}): UnifiedNotification => ({
+    id,
+    dedupeKey: `dk-${id}`,
+    app: 'quantsink',
+    kind: 'broadcast',
+    title: 'T',
+    body: 'B',
+    previews: [],
+    actions: [],
+    occurredAt: new Date(0).toISOString(),
+    receivedAt: new Date(0).toISOString(),
+    priority: 5,
+    read: false,
+    dismissed: false,
+    meta: {},
+    ...overrides,
   });
 
-  it('marks single notification as read', async () => {
-    const store = new InMemoryNotificationStore();
-    const n = {
-      id: 2,
-      eventId: 'e2',
-      app: 'quantchat' as QuantApp,
-      type: 'message' as const,
-      title: 'Msg',
-      occurredAt: new Date().toISOString(),
-      receivedAt: new Date().toISOString(),
-      read: false,
-      priorityScore: 10,
-    };
-    await store.put(n);
-    await store.markRead(2);
-    const all = await store.getAll();
-    expect(all[0].read).toBe(true);
+  it('stores, retrieves and lists', async () => {
+    const s = new InMemoryNotificationStore();
+    await s.put(make('a'));
+    await s.put(make('b', { app: 'quantchat' }));
+    expect((await s.get('a'))?.id).toBe('a');
+    expect((await s.getByDedupeKey('dk-b'))?.id).toBe('b');
+    expect((await s.list()).length).toBe(2);
+    expect((await s.list({ app: 'quantchat' })).length).toBe(1);
+    expect(await s.count()).toBe(2);
   });
 
-  it('marks all notifications as read for a specific app', async () => {
-    const store = new InMemoryNotificationStore();
-    for (let i = 1; i <= 4; i++) {
-      await store.put({
-        id: i,
-        eventId: `e${i}`,
-        app: (i <= 2 ? 'quantchat' : 'quantsink') as QuantApp,
-        type: 'message' as const,
-        title: `n${i}`,
-        occurredAt: new Date().toISOString(),
-        receivedAt: new Date().toISOString(),
-        read: false,
-        priorityScore: 5,
-      });
+  it('updates, deletes and prunes', async () => {
+    const s = new InMemoryNotificationStore();
+    await s.put(make('a', { receivedAt: new Date(1000).toISOString() }));
+    const u = await s.update('a', { read: true });
+    expect(u?.read).toBe(true);
+    expect(await s.delete('a')).toBe(true);
+    expect(await s.delete('a')).toBe(false);
+    await s.put(make('old', { receivedAt: new Date(100).toISOString() }));
+    await s.put(make('new', { receivedAt: new Date(10_000).toISOString() }));
+    expect(await s.pruneOlderThan(1000)).toBe(1);
+    expect(await s.count()).toBe(1);
+  });
+
+  it('sorts and limits', async () => {
+    const s = new InMemoryNotificationStore();
+    await s.put(make('low', { priority: 2 }));
+    await s.put(make('high', { priority: 9 }));
+    const byPri = await s.list({ orderBy: 'priority', order: 'desc', limit: 1 });
+    expect(byPri).toHaveLength(1);
+    expect(byPri[0].id).toBe('high');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// NotificationAggregator
+// ---------------------------------------------------------------------------
+
+describe('NotificationAggregator — normalization & events', () => {
+  it('emits normalized notification on valid ingest', async () => {
+    const { aggregator } = makeAggregator();
+    const got: UnifiedNotification[] = [];
+    aggregator.on('notification', (n) => got.push(n));
+    const n = await aggregator.ingest(makeEvent());
+    expect(n).toBeDefined();
+    expect(got).toHaveLength(1);
+    expect(got[0].app).toBe('quantchat');
+    expect(got[0].kind).toBe('message');
+    expect(got[0].priority).toBeGreaterThan(0);
+  });
+
+  it('derives app from kind when missing', async () => {
+    const { aggregator } = makeAggregator();
+    const n = await aggregator.ingest(makeEvent({ app: undefined, kind: 'match' }));
+    expect(n?.app).toBe('quantchill');
+  });
+
+  it('truncates long titles / bodies', async () => {
+    const { aggregator } = makeAggregator();
+    const long = 'x'.repeat(5000);
+    const n = await aggregator.ingest(makeEvent({ title: long, body: long }));
+    expect(n?.title.length).toBeLessThanOrEqual(200);
+    expect(n?.body.length).toBeLessThanOrEqual(1000);
+  });
+
+  it('drops events with invalid kind and emits error', async () => {
+    const { aggregator } = makeAggregator();
+    const errs: Error[] = [];
+    aggregator.on('error', ({ error }) => errs.push(error));
+    const out = await aggregator.ingest({ kind: 'nope' });
+    expect(out).toBeUndefined();
+    expect(errs.length).toBe(1);
+  });
+
+  it('ingestJson parses JSON and delegates', async () => {
+    const { aggregator } = makeAggregator();
+    const got: UnifiedNotification[] = [];
+    aggregator.on('notification', (n) => got.push(n));
+    await aggregator.ingestJson(JSON.stringify(makeEvent()));
+    expect(got).toHaveLength(1);
+  });
+
+  it('ingestJson handles malformed JSON', async () => {
+    const { aggregator } = makeAggregator();
+    const errs: Error[] = [];
+    aggregator.on('error', ({ error }) => errs.push(error));
+    const out = await aggregator.ingestJson('not-json');
+    expect(out).toBeUndefined();
+    expect(errs.length).toBe(1);
+  });
+});
+
+describe('NotificationAggregator — deduplication', () => {
+  it('suppresses duplicate dedupeKey within the dedup window', async () => {
+    const { aggregator } = makeAggregator();
+    const dups: string[] = [];
+    aggregator.on('duplicate', (d) => dups.push(d.dedupeKey));
+    const first = await aggregator.ingest(makeEvent({ id: 'a', dedupeKey: 'shared' }));
+    const second = await aggregator.ingest(makeEvent({ id: 'b', dedupeKey: 'shared' }));
+    expect(first).toBeDefined();
+    expect(second).toBeUndefined();
+    expect(dups).toEqual(['shared']);
+  });
+
+  it('allows the same dedupeKey after the window passes', async () => {
+    const { aggregator, clock } = makeAggregator();
+    await aggregator.ingest(makeEvent({ id: 'a', dedupeKey: 'shared' }));
+    clock.advance(11 * 60_000);
+    const again = await aggregator.ingest(makeEvent({ id: 'b', dedupeKey: 'shared' }));
+    expect(again).toBeDefined();
+  });
+});
+
+describe('NotificationAggregator — rate limiting', () => {
+  it('queues events beyond the per-minute cap and releases them later', async () => {
+    const { aggregator, clock, timers } = makeAggregator({ maxPerMinute: 3 });
+    const delivered: UnifiedNotification[] = [];
+    const rateLimited: number[] = [];
+    aggregator.on('notification', (n) => delivered.push(n));
+    aggregator.on('rateLimited', (r) => rateLimited.push(r.queued));
+    for (let i = 0; i < 5; i += 1) {
+      await aggregator.ingest(makeEvent({ id: `e${i}`, dedupeKey: `k${i}` }));
     }
-    await store.markAllRead('quantchat');
-    const all = await store.getAll();
-    const chat = all.filter((n) => n.app === 'quantchat');
-    const sink = all.filter((n) => n.app === 'quantsink');
-    expect(chat.every((n) => n.read)).toBe(true);
-    expect(sink.every((n) => !n.read)).toBe(true);
+    expect(delivered).toHaveLength(3);
+    expect(rateLimited.length).toBeGreaterThan(0);
+    expect(aggregator.pendingCount()).toBe(2);
+
+    clock.advance(60_001);
+    timers.runPending();
+    expect(delivered.length).toBe(5);
+    expect(aggregator.pendingCount()).toBe(0);
   });
 
-  it('deletes a notification by id', async () => {
-    const store = new InMemoryNotificationStore();
-    await store.put({
-      id: 10,
-      eventId: 'e10',
-      app: 'quanttube' as QuantApp,
-      type: 'video_engagement' as const,
-      title: 'Video',
-      occurredAt: new Date().toISOString(),
-      receivedAt: new Date().toISOString(),
-      read: false,
-      priorityScore: 5,
+  it('evicts lowest-priority queued item when queue overflows', async () => {
+    // Build a fresh aggregator with an explicit max queue length.
+    const clock = new FakeClock();
+    const timers = new FakeTimers(clock);
+    const { factory } = makeFakeSocket();
+    const agg = new NotificationAggregator({
+      busUrl: 'ws://x',
+      clock,
+      timers,
+      socketFactory: factory,
+      idGenerator: (() => { let i = 0; return () => `g-${++i}`; })(),
+      maxPerMinute: 1,
+      maxQueueLength: 2,
     });
-    expect(await store.count()).toBe(1);
-    await store.delete(10);
-    expect(await store.count()).toBe(0);
-  });
-
-  it('clears all notifications', async () => {
-    const store = new InMemoryNotificationStore();
-    for (let i = 0; i < 5; i++) {
-      await store.put({
-        id: 100 + i,
-        eventId: `ec${i}`,
-        app: 'quantmail' as QuantApp,
-        type: 'email' as const,
-        title: `mail ${i}`,
-        occurredAt: new Date().toISOString(),
-        receivedAt: new Date().toISOString(),
-        read: false,
-        priorityScore: 4,
-      });
-    }
-    await store.clear();
-    expect(await store.count()).toBe(0);
+    await agg.ingest(makeEvent({ id: 'd', dedupeKey: 'd', kind: 'message' })); // delivered
+    await agg.ingest(makeEvent({ id: 'q1', dedupeKey: 'q1', kind: 'system' })); // queued pri 1
+    await agg.ingest(makeEvent({ id: 'q2', dedupeKey: 'q2', kind: 'system' })); // queued pri 1
+    await agg.ingest(makeEvent({ id: 'q3', dedupeKey: 'q3', kind: 'message' })); // message — higher pri
+    expect(agg.pendingCount()).toBe(2);
   });
 });
 
-// ---------------------------------------------------------------------------
-// NotificationRateLimiter
-// ---------------------------------------------------------------------------
-
-describe('NotificationRateLimiter', () => {
-  it('allows notifications up to the limit', () => {
-    const limiter = new NotificationRateLimiter(3, 60_000);
-    const now = 1_000_000;
-    expect(limiter.allow('quantchat', now)).toBe(true);
-    expect(limiter.allow('quantchat', now)).toBe(true);
-    expect(limiter.allow('quantchat', now)).toBe(true);
-    expect(limiter.allow('quantchat', now)).toBe(false);
-  });
-
-  it('resets after the window expires', () => {
-    const limiter = new NotificationRateLimiter(2, 1_000);
-    let now = 1_000_000;
-    limiter.allow('quantsink', now);
-    limiter.allow('quantsink', now);
-    expect(limiter.allow('quantsink', now)).toBe(false);
-    // Advance past the window.
-    now += 1_001;
-    expect(limiter.allow('quantsink', now)).toBe(true);
-  });
-
-  it('tracks limits per app independently', () => {
-    const limiter = new NotificationRateLimiter(1, 60_000);
-    const now = 1_000_000;
-    expect(limiter.allow('quantchat', now)).toBe(true);
-    expect(limiter.allow('quantchat', now)).toBe(false);
-    expect(limiter.allow('quantsink', now)).toBe(true); // different app
-  });
-
-  it('reports remaining capacity', () => {
-    const limiter = new NotificationRateLimiter(5, 60_000);
-    const now = 1_000_000;
-    limiter.allow('quanttube', now);
-    limiter.allow('quanttube', now);
-    expect(limiter.remaining('quanttube', now)).toBe(3);
-  });
-
-  it('resets all buckets on reset()', () => {
-    const limiter = new NotificationRateLimiter(1, 60_000);
-    const now = 1_000_000;
-    limiter.allow('quantchat', now);
-    limiter.reset();
-    expect(limiter.allow('quantchat', now)).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// DeduplicationCache
-// ---------------------------------------------------------------------------
-
-describe('DeduplicationCache', () => {
-  it('marks a new event id as new', () => {
-    const cache = new DeduplicationCache(30_000);
-    expect(cache.isNew('evt-abc', 1000)).toBe(true);
-  });
-
-  it('suppresses duplicate within TTL', () => {
-    const cache = new DeduplicationCache(30_000);
-    cache.isNew('evt-dup', 1000);
-    expect(cache.isNew('evt-dup', 1000 + 1000)).toBe(false);
-  });
-
-  it('allows the same id after TTL expires', () => {
-    const cache = new DeduplicationCache(500);
-    cache.isNew('evt-ttl', 1000);
-    expect(cache.isNew('evt-ttl', 1000 + 600)).toBe(true);
-  });
-
-  it('evicts expired entries', () => {
-    const cache = new DeduplicationCache(100);
-    cache.isNew('evt-evict', 1000);
-    expect(cache.size()).toBe(1);
-    cache.evictExpired(1000 + 200);
-    expect(cache.size()).toBe(0);
-  });
-
-  it('clears all entries', () => {
-    const cache = new DeduplicationCache(30_000);
-    cache.isNew('a', 1000);
-    cache.isNew('b', 1000);
-    cache.clear();
-    expect(cache.size()).toBe(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// APP_EVENT_MAP
-// ---------------------------------------------------------------------------
-
-describe('APP_EVENT_MAP', () => {
-  it('maps all 9 apps to event types', () => {
-    const apps = Object.keys(APP_EVENT_MAP);
-    expect(apps).toHaveLength(9);
-    expect(APP_EVENT_MAP.quantchat).toBe('message');
-    expect(APP_EVENT_MAP.quantsink).toBe('broadcast');
-    expect(APP_EVENT_MAP.quantchill).toBe('match');
-    expect(APP_EVENT_MAP.quantads).toBe('ad_performance');
-    expect(APP_EVENT_MAP.quantedits).toBe('edit_share');
-    expect(APP_EVENT_MAP.quanttube).toBe('video_engagement');
-    expect(APP_EVENT_MAP.quantmail).toBe('email');
-    expect(APP_EVENT_MAP.quantneon).toBe('metaverse_event');
-    expect(APP_EVENT_MAP.quantbrowse).toBe('web_clip');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// NotificationAggregator — core pipeline
-// ---------------------------------------------------------------------------
-
-describe('NotificationAggregator — ingest pipeline', () => {
-  function makeAggregator() {
-    const store = new InMemoryNotificationStore();
-    const rateLimiter = new NotificationRateLimiter(20, 60_000);
-    const dedupCache = new DeduplicationCache(30_000);
-    const aggregator = new NotificationAggregator({
-      store,
-      rateLimiter,
-      dedupCache,
-      autoConnect: false,
-    });
-    return { aggregator, store };
-  }
-
-  it('ingests a valid event and returns an aggregated notification', () => {
+describe('NotificationAggregator — user actions', () => {
+  it('markRead flips read flag and emits events', async () => {
     const { aggregator } = makeAggregator();
-    const result = aggregator.ingest(makeEvent());
-    expect(result).not.toBeNull();
-    expect(result!.read).toBe(false);
-    expect(result!.priorityScore).toBe(0);
-    expect(typeof result!.id).toBe('number');
-    aggregator.destroy();
+    const updates: UnifiedNotification[] = [];
+    aggregator.on('read', (n) => updates.push(n));
+    const n = await aggregator.ingest(makeEvent());
+    const readN = await aggregator.markRead(n!.id);
+    expect(readN?.read).toBe(true);
+    expect(updates).toHaveLength(1);
   });
 
-  it('deduplicates identical event ids', () => {
+  it('markAllReadForApp only affects that app', async () => {
     const { aggregator } = makeAggregator();
-    const evt = makeEvent({ eventId: 'dup-001' });
-    const first = aggregator.ingest(evt);
-    const second = aggregator.ingest(evt);
-    expect(first).not.toBeNull();
-    expect(second).toBeNull();
-    aggregator.destroy();
+    await aggregator.ingest(makeEvent({ id: 'a', dedupeKey: 'a', app: 'quantchat' }));
+    await aggregator.ingest(makeEvent({ id: 'b', dedupeKey: 'b', app: 'quantsink', kind: 'broadcast' }));
+    const n = await aggregator.markAllReadForApp('quantchat');
+    expect(n).toBe(1);
+    const chat = await aggregator.list({ app: 'quantchat' });
+    const sink = await aggregator.list({ app: 'quantsink' });
+    expect(chat.every((x) => x.read)).toBe(true);
+    expect(sink.every((x) => !x.read)).toBe(true);
   });
 
-  it('drops notifications that exceed the rate limit', () => {
-    const store = new InMemoryNotificationStore();
-    const rateLimiter = new NotificationRateLimiter(3, 60_000);
-    const dedupCache = new DeduplicationCache(30_000);
-    const aggregator = new NotificationAggregator({
-      store, rateLimiter, dedupCache, autoConnect: false,
-    });
-
-    const results = [];
-    for (let i = 0; i < 5; i++) {
-      results.push(aggregator.ingest(makeEvent({ app: 'quantchat' })));
-    }
-    const passed = results.filter(Boolean);
-    const dropped = results.filter((r) => r === null);
-    expect(passed).toHaveLength(3);
-    expect(dropped).toHaveLength(2);
-    aggregator.destroy();
-  });
-
-  it('notifies listeners when a new event is ingested', () => {
+  it('dismiss marks dismissed and suppresses from badge counts', async () => {
     const { aggregator } = makeAggregator();
-    const received: unknown[] = [];
-    aggregator.subscribe((n) => received.push(n));
-    aggregator.ingest(makeEvent());
-    expect(received).toHaveLength(1);
-    aggregator.destroy();
-  });
-
-  it('unsubscribe stops listener from receiving future events', () => {
-    const { aggregator } = makeAggregator();
-    const received: unknown[] = [];
-    const unsub = aggregator.subscribe((n) => received.push(n));
-    aggregator.ingest(makeEvent());
-    unsub();
-    aggregator.ingest(makeEvent());
-    expect(received).toHaveLength(1);
-    aggregator.destroy();
-  });
-
-  it('persists notification to store on ingest', async () => {
-    const { aggregator, store } = makeAggregator();
-    aggregator.ingest(makeEvent());
-    // give the async store.put a tick to resolve
-    await new Promise((r) => setTimeout(r, 10));
-    const all = await store.getAll();
-    expect(all).toHaveLength(1);
-    aggregator.destroy();
-  });
-
-  it('getByApp filters by source app', async () => {
-    const { aggregator } = makeAggregator();
-    aggregator.ingest(makeEvent({ app: 'quantchat' }));
-    aggregator.ingest(makeEvent({ app: 'quantsink' }));
-    aggregator.ingest(makeEvent({ app: 'quantchat' }));
-    await new Promise((r) => setTimeout(r, 10));
-    const chatOnly = await aggregator.getByApp('quantchat');
-    expect(chatOnly).toHaveLength(2);
-    aggregator.destroy();
-  });
-
-  it('markAllRead marks all unread items', async () => {
-    const { aggregator } = makeAggregator();
-    for (let i = 0; i < 3; i++) aggregator.ingest(makeEvent({ app: 'quantmail' }));
-    await new Promise((r) => setTimeout(r, 10));
-    await aggregator.markAllRead('quantmail');
-    const unread = await aggregator.getUnread();
-    expect(unread.filter((n) => n.app === 'quantmail')).toHaveLength(0);
-    aggregator.destroy();
-  });
-
-  it('badgeCounts returns correct counts per app', async () => {
-    const { aggregator } = makeAggregator();
-    aggregator.ingest(makeEvent({ app: 'quantchat' }));
-    aggregator.ingest(makeEvent({ app: 'quantchat' }));
-    aggregator.ingest(makeEvent({ app: 'quanttube' }));
-    await new Promise((r) => setTimeout(r, 10));
+    const n = await aggregator.ingest(makeEvent());
+    await aggregator.dismiss(n!.id);
     const counts = await aggregator.badgeCounts();
-    expect(counts.quantchat).toBe(2);
-    expect(counts.quanttube).toBe(1);
-    expect(counts.quantsink).toBe(0);
-    aggregator.destroy();
+    expect(counts.quantchat).toBe(0);
   });
 
-  it('diagnostics reports correct state', () => {
+  it('snoozed notifications do not appear in badge counts', async () => {
+    const { aggregator, clock } = makeAggregator();
+    const n = await aggregator.ingest(makeEvent());
+    await aggregator.snooze(n!.id, 60_000);
+    const counts = await aggregator.badgeCounts();
+    expect(counts.quantchat).toBe(0);
+    clock.advance(60_001);
+    const counts2 = await aggregator.badgeCounts();
+    expect(counts2.quantchat).toBe(1);
+  });
+
+  it('invokeAction relays upstream and marks read', async () => {
+    const { socket, factory, sent, trigger } = makeFakeSocket();
+    void socket;
+    const { aggregator } = makeAggregator({ socketFactory: factory });
+    aggregator.connect();
+    trigger.open();
+    const n = await aggregator.ingest(
+      makeEvent({
+        actions: [{ id: 'reply', label: 'Reply', intent: 'reply' }],
+      }),
+    );
+    await aggregator.invokeAction(n!.id, 'reply', { text: 'hi' });
+    const relayed = sent.find((s) => s.includes('NOTIFICATION_ACTION'));
+    expect(relayed).toBeDefined();
+    expect(relayed).toContain('"text":"hi"');
+  });
+
+  it('invokeAction throws on unknown action id', async () => {
     const { aggregator } = makeAggregator();
-    aggregator.ingest(makeEvent());
-    const d = aggregator.diagnostics();
-    expect(d.idCounter).toBe(1);
-    expect(d.connected).toBe(false);
-    aggregator.destroy();
+    const n = await aggregator.ingest(makeEvent());
+    await expect(aggregator.invokeAction(n!.id, 'nope')).rejects.toThrow();
+  });
+});
+
+describe('NotificationAggregator — socket lifecycle', () => {
+  it('connects, emits connected, relays bus messages', async () => {
+    const fake = makeFakeSocket();
+    const { aggregator } = makeAggregator({ socketFactory: fake.factory });
+    const got: UnifiedNotification[] = [];
+    aggregator.on('notification', (n) => got.push(n));
+    let connected = false;
+    aggregator.on('connected', () => { connected = true; });
+
+    aggregator.connect();
+    fake.trigger.open();
+    expect(connected).toBe(true);
+    fake.trigger.message(JSON.stringify(makeEvent()));
+    await new Promise((r) => setImmediate(r));
+    expect(got).toHaveLength(1);
+  });
+
+  it('schedules reconnect on close', async () => {
+    const fake = makeFakeSocket();
+    const { aggregator, timers } = makeAggregator({ socketFactory: fake.factory });
+    let disconnects = 0;
+    aggregator.on('disconnected', () => disconnects++);
+    aggregator.connect();
+    fake.trigger.open();
+    fake.trigger.close(1006, 'bye');
+    expect(disconnects).toBe(1);
+    // After reconnect timer fires, connect will be attempted again
+    expect(() => timers.runPending()).not.toThrow();
+  });
+});
+
+describe('NotificationAggregator — enforceStorageBudget', () => {
+  it('drops oldest read items first when over capacity', async () => {
+    const clock = new FakeClock();
+    const timers = new FakeTimers(clock);
+    const { factory } = makeFakeSocket();
+    let i = 0;
+    const agg = new NotificationAggregator({
+      busUrl: 'ws://x',
+      clock,
+      timers,
+      socketFactory: factory,
+      idGenerator: () => `g-${++i}`,
+      maxStoredNotifications: 3,
+      maxPerMinute: 100,
+    });
+    const a = await agg.ingest(makeEvent({ id: 'a', dedupeKey: 'a' }));
+    await agg.markRead(a!.id);
+    clock.advance(1);
+    await agg.ingest(makeEvent({ id: 'b', dedupeKey: 'b' }));
+    clock.advance(1);
+    await agg.ingest(makeEvent({ id: 'c', dedupeKey: 'c' }));
+    clock.advance(1);
+    await agg.ingest(makeEvent({ id: 'd', dedupeKey: 'd' }));
+    const all = await agg.list();
+    expect(all.length).toBeLessThanOrEqual(3);
+    expect(all.some((x) => x.id === a!.id)).toBe(false);
   });
 });

@@ -1,355 +1,278 @@
 import {
-  NotificationPriorityAI,
   BASE_PRIORITY,
-  hourInRange,
-  dateInDndBlock,
-  computePreferenceBoost,
+  DEFAULT_SMART_SCHEDULE,
+  NotificationPriorityAI,
+  PRIORITY_AI_CONSTANTS,
+  specPriorityBucket,
 } from '../services/NotificationPriorityAI';
-import type {
-  DndBlock,
-  UserPreferenceSnapshot,
-} from '../services/NotificationPriorityAI';
-import type { AggregatedNotification, QuantApp } from '../services/NotificationAggregator';
+import type { UnifiedNotification } from '../services/NotificationAggregator';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-let idSeq = 0;
-
-function makeNotification(
-  overrides: Partial<AggregatedNotification> = {},
-): AggregatedNotification {
-  idSeq += 1;
+function makeNotification(overrides: Partial<UnifiedNotification> = {}): UnifiedNotification {
   return {
-    id: idSeq,
-    eventId: `evt-${idSeq}`,
-    app: 'quantchat',
-    type: 'message',
-    title: 'Test',
-    occurredAt: new Date().toISOString(),
-    receivedAt: new Date().toISOString(),
+    id: 'n1',
+    dedupeKey: 'k1',
+    app: 'quantsink',
+    kind: 'broadcast',
+    title: 'Hello world',
+    body: 'Body text',
+    previews: [],
+    actions: [],
+    occurredAt: new Date(0).toISOString(),
+    receivedAt: new Date(0).toISOString(),
+    priority: 5,
     read: false,
-    priorityScore: 0,
+    dismissed: false,
+    meta: {},
     ...overrides,
   };
 }
 
-function makeAI(opts?: ConstructorParameters<typeof NotificationPriorityAI>[0]) {
-  return new NotificationPriorityAI(opts);
+class Clock {
+  constructor(public ms = 100_000) {}
+  now = (): number => this.ms;
 }
 
-// ---------------------------------------------------------------------------
-// hourInRange
-// ---------------------------------------------------------------------------
+describe('NotificationPriorityAI — base scores', () => {
+  const ai = new NotificationPriorityAI({ clock: new Clock() });
 
-describe('hourInRange', () => {
-  it('handles normal ranges', () => {
-    expect(hourInRange(9, 9, 17)).toBe(true);
-    expect(hourInRange(8, 9, 17)).toBe(false);
-    expect(hourInRange(17, 9, 17)).toBe(false);
+  it('maps every kind to its base priority', () => {
+    for (const [kind, base] of Object.entries(BASE_PRIORITY)) {
+      const n = makeNotification({
+        kind: kind as UnifiedNotification['kind'],
+        occurredAt: new Date(100_000).toISOString(),
+      });
+      const d = ai.evaluate(n);
+      expect(d.base).toBe(base);
+    }
   });
 
-  it('handles wrap-around (sleep) ranges', () => {
-    expect(hourInRange(23, 23, 7)).toBe(true);
-    expect(hourInRange(0, 23, 7)).toBe(true);
-    expect(hourInRange(6, 23, 7)).toBe(true);
-    expect(hourInRange(7, 23, 7)).toBe(false);
-    expect(hourInRange(12, 23, 7)).toBe(false);
+  it('clamps final score within 1..10', () => {
+    const n = makeNotification({ kind: 'system', title: 'urgent!' });
+    const s = ai.score(n);
+    expect(s).toBeGreaterThanOrEqual(1);
+    expect(s).toBeLessThanOrEqual(10);
   });
 
-  it('returns false when start equals end', () => {
-    expect(hourInRange(10, 10, 10)).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// dateInDndBlock
-// ---------------------------------------------------------------------------
-
-describe('dateInDndBlock', () => {
-  it('matches a date within the block hours', () => {
-    const block: DndBlock = { startHour: 22, endHour: 8 };
-    const inside = new Date('2026-04-17T23:00:00');
-    expect(dateInDndBlock(inside, block)).toBe(true);
-  });
-
-  it('does not match a date outside the block hours', () => {
-    const block: DndBlock = { startHour: 22, endHour: 8 };
-    const outside = new Date('2026-04-17T14:00:00');
-    expect(dateInDndBlock(outside, block)).toBe(false);
-  });
-
-  it('respects day-of-week restriction', () => {
-    // Saturday = 6, Sunday = 0
-    const block: DndBlock = { startHour: 9, endHour: 17, days: [6] };
-    const saturday = new Date('2026-04-18T12:00:00'); // Saturday
-    const friday = new Date('2026-04-17T12:00:00'); // Friday
-    expect(dateInDndBlock(saturday, block)).toBe(true);
-    expect(dateInDndBlock(friday, block)).toBe(false);
+  it('specPriorityBucket returns documented spec values', () => {
+    expect(specPriorityBucket('message').value).toBe(10);
+    expect(specPriorityBucket('match').value).toBe(8);
+    expect(specPriorityBucket('broadcast').value).toBe(5);
+    expect(specPriorityBucket('ad_performance').value).toBe(2);
+    expect(specPriorityBucket('system').value).toBe(1);
   });
 });
 
-// ---------------------------------------------------------------------------
-// computePreferenceBoost
-// ---------------------------------------------------------------------------
-
-describe('computePreferenceBoost', () => {
-  const clicks: Record<QuantApp, number> = {
-    quantchat: 0, quantsink: 0, quantchill: 0, quantads: 0,
-    quantedits: 0, quanttube: 0, quantmail: 0, quantneon: 0, quantbrowse: 0,
-  };
-  const deliveries: Record<QuantApp, number> = { ...clicks };
-
-  it('returns 0 with no data (Laplace smoothed CTR = 0.5)', () => {
-    const boost = computePreferenceBoost('quantchat', clicks, deliveries, 3);
-    expect(boost).toBe(0);
-  });
-
-  it('returns positive boost for high CTR app', () => {
-    const highClicks = { ...clicks, quantchat: 9 };
-    const highDeliveries = { ...deliveries, quantchat: 10 };
-    const boost = computePreferenceBoost('quantchat', highClicks, highDeliveries, 3);
-    expect(boost).toBeGreaterThan(0);
-  });
-
-  it('clamps boost to [0, maxBoost]', () => {
-    const highClicks = { ...clicks, quantsink: 1000 };
-    const highDeliveries = { ...deliveries, quantsink: 1000 };
-    const boost = computePreferenceBoost('quantsink', highClicks, highDeliveries, 3);
-    expect(boost).toBeLessThanOrEqual(3);
-    expect(boost).toBeGreaterThanOrEqual(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// BASE_PRIORITY table
-// ---------------------------------------------------------------------------
-
-describe('BASE_PRIORITY', () => {
-  it('message has the highest base priority (10)', () => {
-    expect(BASE_PRIORITY.message).toBe(10);
-  });
-  it('match has priority 8', () => {
-    expect(BASE_PRIORITY.match).toBe(8);
-  });
-  it('ad_performance has the lowest base priority (2)', () => {
-    expect(BASE_PRIORITY.ad_performance).toBe(2);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// NotificationPriorityAI — scoring
-// ---------------------------------------------------------------------------
-
-describe('NotificationPriorityAI — score', () => {
-  it('returns a message notification with base score 10', () => {
-    const ai = makeAI({ now: () => new Date('2026-04-17T14:00:00') });
-    const n = makeNotification({ app: 'quantchat', type: 'message' });
-    const result = ai.score(n);
-    expect(result.baseScore).toBe(10);
-    expect(result.suppressed).toBe(false);
-  });
-
-  it('returns an ad_performance notification with base score 2', () => {
-    const ai = makeAI({ now: () => new Date('2026-04-17T14:00:00') });
-    const n = makeNotification({ app: 'quantads', type: 'ad_performance' });
-    const result = ai.score(n);
-    expect(result.baseScore).toBe(2);
-  });
-
-  it('clamps score to MAX_PRIORITY even with boost', () => {
-    const ai = makeAI({
-      now: () => new Date('2026-04-17T14:00:00'),
-      maxPreferenceBoost: 5,
+describe('NotificationPriorityAI — close-friend boost', () => {
+  it('promotes DM from close friend to priority 10', () => {
+    const ai = new NotificationPriorityAI({
+      clock: new Clock(),
+      closeFriends: [{ userId: 'u-friend', affinity: 1 }],
     });
-    const n = makeNotification({ app: 'quantchat', type: 'message' });
-    // Record many clicks to maximise boost.
-    for (let i = 0; i < 100; i++) ai.recordClick('quantchat');
-    for (let i = 0; i < 100; i++) ai.recordDelivery('quantchat');
-    const result = ai.score(n);
-    expect(result.clamped).toBeLessThanOrEqual(10);
+    const n = makeNotification({
+      kind: 'message',
+      senderId: 'u-friend',
+      occurredAt: new Date(100_000).toISOString(),
+    });
+    expect(ai.score(n)).toBe(10);
   });
 
-  it('marks notification as suppressed during sleep hours', () => {
-    // 02:00 — well within default sleep window (23:00–07:00)
-    const ai = makeAI({ now: () => new Date('2026-04-17T02:00:00') });
-    const n = makeNotification();
-    const result = ai.score(n);
-    expect(result.suppressed).toBe(true);
-    expect(result.suppressReason).toMatch(/sleep/i);
+  it('leaves a DM from a stranger at base message level', () => {
+    const ai = new NotificationPriorityAI({
+      clock: new Clock(),
+      closeFriends: [{ userId: 'u-other', affinity: 1 }],
+    });
+    const n = makeNotification({
+      kind: 'message',
+      senderId: 'stranger',
+      occurredAt: new Date(100_000).toISOString(),
+    });
+    const d = ai.evaluate(n);
+    expect(d.closeFriendBoost).toBe(0);
   });
 
-  it('does not suppress notifications outside sleep hours', () => {
-    const ai = makeAI({ now: () => new Date('2026-04-17T10:00:00') });
-    const n = makeNotification();
-    const result = ai.score(n);
-    expect(result.suppressed).toBe(false);
+  it('tags VIP notifications from friends', () => {
+    const ai = new NotificationPriorityAI({
+      clock: new Clock(),
+      closeFriends: [{ userId: 'u-friend', affinity: 0.8 }],
+    });
+    const n = makeNotification({
+      kind: 'match',
+      senderId: 'u-friend',
+      occurredAt: new Date(100_000).toISOString(),
+    });
+    expect(ai.evaluate(n).tags).toContain('vip');
+  });
+
+  it('addCloseFriend validates affinity range', () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    expect(() => ai.addCloseFriend({ userId: 'x', affinity: 2 })).toThrow();
+    expect(() => ai.addCloseFriend({ userId: '', affinity: 0.5 })).toThrow();
+  });
+
+  it('removeCloseFriend returns false when missing', () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    expect(ai.removeCloseFriend('nope')).toBe(false);
   });
 });
 
-// ---------------------------------------------------------------------------
-// NotificationPriorityAI — DND manual blocks
-// ---------------------------------------------------------------------------
-
-describe('NotificationPriorityAI — DND manual blocks', () => {
-  it('suppresses during a manually added DND block', () => {
-    const ai = makeAI({
-      now: () => new Date('2026-04-17T15:30:00'),
-      initialPreferences: { smartDndEnabled: false },
-    });
-    ai.addDndBlock({ startHour: 14, endHour: 17, label: 'Focus time' });
-    const result = ai.shouldSuppress(new Date('2026-04-17T15:30:00'));
-    expect(result.suppressed).toBe(true);
-    expect(result.reason).toContain('Focus time');
-  });
-
-  it('does not suppress outside the manual block', () => {
-    const ai = makeAI({
-      now: () => new Date('2026-04-17T18:00:00'),
-      initialPreferences: { smartDndEnabled: false },
-    });
-    ai.addDndBlock({ startHour: 14, endHour: 17, label: 'Focus time' });
-    const result = ai.shouldSuppress(new Date('2026-04-17T18:00:00'));
-    expect(result.suppressed).toBe(false);
-  });
-
-  it('removes a DND block by index', () => {
-    const ai = makeAI({ initialPreferences: { smartDndEnabled: false } });
-    ai.addDndBlock({ startHour: 9, endHour: 10 });
-    ai.addDndBlock({ startHour: 14, endHour: 15 });
-    ai.removeDndBlock(0);
-    expect(ai.getDndBlocks()).toHaveLength(1);
-    expect(ai.getDndBlocks()[0].startHour).toBe(14);
-  });
-
-  it('sets sleep window and validates range', () => {
-    const ai = makeAI();
-    ai.setSleepWindow(22, 6);
-    expect(ai.getSleepWindow()).toEqual({ startHour: 22, endHour: 6 });
-  });
-
-  it('rejects invalid sleep window hours', () => {
-    const ai = makeAI();
-    expect(() => ai.setSleepWindow(-1, 7)).toThrow(RangeError);
-    expect(() => ai.setSleepWindow(0, 25)).toThrow(RangeError);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// NotificationPriorityAI — preference learning
-// ---------------------------------------------------------------------------
-
-describe('NotificationPriorityAI — preference learning', () => {
-  it('recordClick increases preference boost for that app', () => {
-    const ai = makeAI({ now: () => new Date('2026-04-17T14:00:00') });
-    const before = ai.score(makeNotification({ app: 'quanttube', type: 'video_engagement' })).clamped;
-
-    for (let i = 0; i < 30; i++) ai.recordClick('quanttube');
-    for (let i = 0; i < 30; i++) ai.recordDelivery('quanttube');
-
-    const after = ai.score(makeNotification({ app: 'quanttube', type: 'video_engagement' })).clamped;
+describe('NotificationPriorityAI — learned preferences', () => {
+  it('click feedback raises bias, mute feedback lowers it', async () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    const before = ai.getPreferences().quantsink.bias;
+    await ai.recordFeedback('quantsink', 'click');
+    await ai.recordFeedback('quantsink', 'click');
+    const after = ai.getPreferences().quantsink.bias;
     expect(after).toBeGreaterThan(before);
+    await ai.recordFeedback('quantsink', 'mute');
+    const afterMute = ai.getPreferences().quantsink.bias;
+    expect(afterMute).toBeLessThan(after);
   });
 
-  it('topPreferredApp returns null with no click data', () => {
-    const ai = makeAI();
-    expect(ai.topPreferredApp()).toBeNull();
+  it('bias is clamped to ±2', async () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    for (let i = 0; i < 100; i += 1) await ai.recordFeedback('quantsink', 'click');
+    expect(ai.getPreferences().quantsink.bias).toBeLessThanOrEqual(2);
+    for (let i = 0; i < 100; i += 1) await ai.recordFeedback('quantsink', 'report');
+    expect(ai.getPreferences().quantsink.bias).toBeGreaterThanOrEqual(-2);
   });
 
-  it('topPreferredApp returns the most clicked app', () => {
-    const ai = makeAI();
-    // Record both clicks and deliveries so CTR is meaningful.
-    for (let i = 0; i < 10; i++) { ai.recordClick('quantsink'); ai.recordDelivery('quantsink'); }
-    for (let i = 0; i < 3; i++) { ai.recordClick('quantchat'); ai.recordDelivery('quantchat'); }
-    expect(ai.topPreferredApp()).toBe('quantsink');
+  it('rejects unknown app', async () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    // @ts-expect-error – testing runtime guard
+    await expect(ai.recordFeedback('nope', 'click')).rejects.toThrow();
   });
 
-  it('ctrReport is sorted by CTR descending', () => {
-    const ai = makeAI();
-    for (let i = 0; i < 5; i++) { ai.recordDelivery('quantmail'); ai.recordClick('quantmail'); }
-    for (let i = 0; i < 10; i++) { ai.recordDelivery('quantchat'); ai.recordClick('quantchat'); }
-    const report = ai.ctrReport();
-    expect(report[0].ctr).toBeGreaterThanOrEqual(report[1].ctr);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// NotificationPriorityAI — snapshot & restore
-// ---------------------------------------------------------------------------
-
-describe('NotificationPriorityAI — snapshot & restore', () => {
-  it('round-trips preferences through snapshot/restore', () => {
-    const ai = makeAI();
-    for (let i = 0; i < 5; i++) ai.recordClick('quantchill');
-    ai.addDndBlock({ startHour: 20, endHour: 22, label: 'Evening' });
-    ai.setSleepWindow(22, 6);
-
-    const snap = ai.snapshot();
-    const ai2 = makeAI({ initialPreferences: snap });
-
-    expect(ai2.snapshot().clicksByApp.quantchill).toBe(5);
-    expect(ai2.getDndBlocks()).toHaveLength(1);
-    expect(ai2.getSleepWindow()).toEqual({ startHour: 22, endHour: 6 });
-  });
-
-  it('restoreFrom replaces existing preferences', () => {
-    const ai = makeAI();
-    for (let i = 0; i < 10; i++) ai.recordClick('quantads');
-
-    const snap: UserPreferenceSnapshot = {
-      clicksByApp: {
-        quantchat: 3, quantsink: 0, quantchill: 0, quantads: 0,
-        quantedits: 0, quanttube: 0, quantmail: 0, quantneon: 0, quantbrowse: 0,
-      },
-      deliveryByApp: {
-        quantchat: 10, quantsink: 0, quantchill: 0, quantads: 0,
-        quantedits: 0, quanttube: 0, quantmail: 0, quantneon: 0, quantbrowse: 0,
-      },
-      dndBlocks: [],
-      smartDndEnabled: false,
-      sleepStartHour: 0,
-      sleepEndHour: 0,
+  it('persists state through hydrate/persist', async () => {
+    const shared: { state?: Record<string, unknown> } = {};
+    const store = {
+      load: async () => (shared.state as never) ?? undefined,
+      save: async (s: Record<string, unknown>) => { shared.state = s; },
     };
-    ai.restoreFrom(snap);
-    expect(ai.snapshot().clicksByApp.quantads).toBe(0);
-    expect(ai.snapshot().clicksByApp.quantchat).toBe(3);
-  });
-
-  it('resetPreferences wipes clicks and dnd blocks', () => {
-    const ai = makeAI();
-    for (let i = 0; i < 5; i++) ai.recordClick('quantneon');
-    ai.addDndBlock({ startHour: 10, endHour: 12 });
-    ai.resetPreferences();
-    expect(ai.snapshot().clicksByApp.quantneon).toBe(0);
-    expect(ai.getDndBlocks()).toHaveLength(0);
+    const ai = new NotificationPriorityAI({ clock: new Clock(), preferenceStore: store });
+    await ai.hydrate();
+    await ai.recordFeedback('quantchat', 'click');
+    const ai2 = new NotificationPriorityAI({ clock: new Clock(), preferenceStore: store });
+    await ai2.hydrate();
+    expect(ai2.getPreferences().quantchat.bias).toBeGreaterThan(0);
   });
 });
 
-// ---------------------------------------------------------------------------
-// NotificationPriorityAI — sortByPriority
-// ---------------------------------------------------------------------------
-
-describe('NotificationPriorityAI — sortByPriority', () => {
-  it('sorts notifications from highest to lowest priority score', () => {
-    const ai = makeAI();
-    const notifications = [
-      makeNotification({ priorityScore: 3 }),
-      makeNotification({ priorityScore: 9 }),
-      makeNotification({ priorityScore: 6 }),
-    ];
-    const sorted = ai.sortByPriority(notifications);
-    expect(sorted.map((n) => n.priorityScore)).toEqual([9, 6, 3]);
+describe('NotificationPriorityAI — DND scheduling', () => {
+  it('suppresses low-priority notifications during sleep', () => {
+    // Sleep window default is 23:00 → 07:00 UTC with tz 0.
+    const midnight = Date.UTC(2026, 0, 1, 0, 30);
+    const ai = new NotificationPriorityAI({ clock: { now: () => midnight } });
+    const n = makeNotification({
+      kind: 'ad_performance',
+      occurredAt: new Date(midnight).toISOString(),
+    });
+    const d = ai.evaluate(n);
+    expect(d.suppress).toBe(true);
+    expect(d.matchedDndRules.length).toBeGreaterThan(0);
   });
 
-  it('does not mutate the input array', () => {
-    const ai = makeAI();
-    const input = [
-      makeNotification({ priorityScore: 1 }),
-      makeNotification({ priorityScore: 8 }),
-    ];
-    const original = [...input];
-    ai.sortByPriority(input);
-    expect(input[0].priorityScore).toBe(original[0].priorityScore);
+  it('does not suppress high-priority DMs during sleep', () => {
+    const midnight = Date.UTC(2026, 0, 1, 0, 30);
+    const ai = new NotificationPriorityAI({
+      clock: { now: () => midnight },
+      closeFriends: [{ userId: 'u', affinity: 1 }],
+    });
+    const n = makeNotification({
+      kind: 'message',
+      senderId: 'u',
+      occurredAt: new Date(midnight).toISOString(),
+    });
+    expect(ai.evaluate(n).suppress).toBe(false);
+  });
+
+  it('custom DND rules are enforceable and removable', () => {
+    const noon = Date.UTC(2026, 0, 5, 12, 0); // a Monday
+    const ai = new NotificationPriorityAI({ clock: { now: () => noon } });
+    ai.setSmartSchedule({ focusStartMinute: 0, focusEndMinute: 0 }); // disable focus
+    ai.addDndRule({
+      id: 'lunch',
+      label: 'Lunch',
+      daysOfWeek: [1, 2, 3, 4, 5],
+      startMinute: 12 * 60,
+      endMinute: 13 * 60,
+      suppressBelowPriority: 11,
+    });
+    const n = makeNotification({
+      kind: 'broadcast',
+      occurredAt: new Date(noon).toISOString(),
+    });
+    expect(ai.evaluate(n).suppress).toBe(true);
+    expect(ai.removeDndRule('lunch')).toBe(true);
+    expect(ai.evaluate(n).suppress).toBe(false);
+  });
+
+  it('enableManualDnd expires automatically', () => {
+    // 10:00 UTC on a Saturday (outside default sleep+focus windows).
+    const t0 = Date.UTC(2026, 0, 3, 10, 0);
+    let t = t0;
+    const ai = new NotificationPriorityAI({ clock: { now: () => t } });
+    ai.enableManualDnd(5000, 11);
+    const n = makeNotification({ kind: 'broadcast', occurredAt: new Date(t).toISOString() });
+    expect(ai.evaluate(n).suppress).toBe(true);
+    t += 6000;
+    expect(ai.evaluate(n).suppress).toBe(false);
+  });
+
+  it('rejects invalid rules', () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    expect(() =>
+      ai.addDndRule({
+        id: 'bad',
+        label: 'x',
+        daysOfWeek: [9],
+        startMinute: 0,
+        endMinute: 100,
+        suppressBelowPriority: 5,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('NotificationPriorityAI — content signal', () => {
+  it('urgent keywords boost score and tag', () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    const n = makeNotification({
+      kind: 'email',
+      title: 'URGENT: verify account',
+      body: 'security alert',
+      occurredAt: new Date(100_000).toISOString(),
+    });
+    const d = ai.evaluate(n);
+    expect(d.contentBoost).toBeGreaterThan(0);
+    expect(d.tags).toContain('urgent');
+  });
+
+  it('promotional keywords reduce score', () => {
+    const ai = new NotificationPriorityAI({ clock: new Clock() });
+    const n = makeNotification({
+      kind: 'email',
+      title: '50% off sale',
+      body: 'limited time deal',
+      occurredAt: new Date(100_000).toISOString(),
+    });
+    const d = ai.evaluate(n);
+    expect(d.tags).toContain('promotional');
+  });
+});
+
+describe('NotificationPriorityAI — diagnostics', () => {
+  it('describe() returns snapshot fields', () => {
+    const ai = new NotificationPriorityAI({
+      clock: new Clock(),
+      closeFriends: [{ userId: 'u', affinity: 0.5 }],
+    });
+    const d = ai.describe();
+    expect(d.closeFriends).toBe(1);
+    expect(d.schedule).toEqual(expect.objectContaining(DEFAULT_SMART_SCHEDULE));
+    expect(Object.keys(d.biases).length).toBeGreaterThan(0);
+  });
+
+  it('exports tunables via PRIORITY_AI_CONSTANTS', () => {
+    expect(PRIORITY_AI_CONSTANTS.BASE_PRIORITY).toBe(BASE_PRIORITY);
   });
 });

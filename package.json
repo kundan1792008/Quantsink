@@ -13,7 +13,7 @@
     "start": "npm run start:frontend",
     "start:frontend": "next start",
     "start:backend": "node dist/index.js",
-    "lint": "eslint \"app/**/*.{ts,tsx}\" \"components/**/*.{ts,tsx}\" \"src/**/*.ts\"",
+    "lint": "eslint \"app/**/*.{ts,tsx}\" \"components/**/*.{ts,tsx}\" \"src/**/*.ts\" \"src/components/**/*.tsx\"",
     "test": "jest",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
