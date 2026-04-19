@@ -22,7 +22,6 @@
 import logger from '../lib/logger';
 import {
   Clock,
-  KIND_TO_APP,
   NotificationKind,
   PriorityScorer,
   QUANT_APPS,

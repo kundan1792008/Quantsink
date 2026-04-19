@@ -240,7 +240,7 @@ export class InMemoryNotificationStore implements NotificationStore {
 
   async list(filter: NotificationListFilter = {}): Promise<UnifiedNotification[]> {
     const out: UnifiedNotification[] = [];
-    for (const n of this.byId.values()) {
+    for (const n of Array.from(this.byId.values())) {
       if (filter.app && n.app !== filter.app) continue;
       if (typeof filter.read === 'boolean' && n.read !== filter.read) continue;
       if (typeof filter.dismissed === 'boolean' && n.dismissed !== filter.dismissed) continue;
@@ -281,7 +281,7 @@ export class InMemoryNotificationStore implements NotificationStore {
 
   async pruneOlderThan(epochMs: number): Promise<number> {
     let removed = 0;
-    for (const n of [...this.byId.values()]) {
+    for (const n of Array.from(this.byId.values())) {
       if (Date.parse(n.receivedAt) < epochMs) {
         this.byId.delete(n.id);
         this.byDedupe.delete(n.dedupeKey);
@@ -396,7 +396,7 @@ class TypedEmitter<E extends Record<string, unknown>> {
   emit<K extends keyof E>(event: K, payload: E[K]): void {
     const set = this.listeners[event];
     if (!set) return;
-    for (const fn of [...set]) {
+    for (const fn of Array.from(set)) {
       try {
         fn(payload);
       } catch (err) {
@@ -928,7 +928,7 @@ export class NotificationAggregator {
 
   private evictExpiredDedupe(): void {
     const cutoff = this.clock.now() - NotificationAggregator.DEDUPE_WINDOW_MS;
-    for (const [k, ts] of this.recentDedupe) {
+    for (const [k, ts] of Array.from(this.recentDedupe.entries())) {
       if (ts < cutoff) this.recentDedupe.delete(k);
     }
   }
