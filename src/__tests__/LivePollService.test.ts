@@ -1,247 +1,285 @@
-import { LivePollService, resetLivePollService } from '../services/LivePollService';
+import {
+  LivePollService,
+  SchedulerApi,
+  TimerHandle,
+  PollTally,
+  RevealPayload,
+} from '../services/LivePollService';
 
-beforeEach(() => {
-  resetLivePollService();
-});
+class ManualClock {
+  current = 2_000_000;
+  now(): number {
+    return this.current;
+  }
+  advance(ms: number): void {
+    this.current += ms;
+  }
+}
 
-afterEach(() => {
-  resetLivePollService();
-});
+class ManualScheduler implements SchedulerApi {
+  callbacks: Array<{ fn: () => void; ms: number; id: number }> = [];
+  private nextId = 1;
+  setInterval(fn: () => void, ms: number): TimerHandle {
+    const id = this.nextId++;
+    this.callbacks.push({ fn, ms, id });
+    return { __brand: 'pollTimer', id } as unknown as TimerHandle;
+  }
+  clearInterval(handle: TimerHandle): void {
+    const id = (handle as unknown as { id: number }).id;
+    this.callbacks = this.callbacks.filter((c) => c.id !== id);
+  }
+  fireAll(): void {
+    for (const c of this.callbacks.slice()) c.fn();
+  }
+}
 
-// ─── Poll creation ────────────────────────────────────────────────────────────
+let idCounter = 0;
+const idFactory = () => `poll_${++idCounter}`;
 
-describe('LivePollService — poll creation', () => {
-  it('creates a poll with auto-start', () => {
-    const svc = new LivePollService();
+function createService(opts: Partial<{ clock: ManualClock; scheduler: ManualScheduler }> = {}) {
+  idCounter = 0;
+  const clock = opts.clock ?? new ManualClock();
+  const scheduler = opts.scheduler ?? new ManualScheduler();
+  const svc = new LivePollService({ clock, scheduler, idFactory });
+  svc.start();
+  return { svc, clock, scheduler };
+}
+
+describe('LivePollService.createPoll', () => {
+  it('creates a poll with normalised options and returns it', () => {
+    const { svc } = createService();
     const poll = svc.createPoll({
       broadcastId: 'b1',
-      question: 'Which token moons first?',
-      options: ['BTC', 'ETH'],
+      creatorId: 'c1',
+      question: 'Best framework?',
+      options: [{ label: 'React' }, { label: 'Svelte' }, { label: 'Vue' }],
+      durationMs: 30_000,
     });
-
-    expect(poll.status).toBe('active');
-    expect(poll.options).toHaveLength(2);
-    expect(poll.totalVotes).toBe(0);
-    expect(svc.getActivePollId('b1')).toBe(poll.id);
+    expect(poll.id).toBe('poll_1');
+    expect(poll.options).toHaveLength(3);
+    expect(poll.options[0].id).toBe('opt_1');
+    expect(poll.state).toBe('OPEN');
+    expect(poll.mode).toBe('STANDARD');
   });
 
-  it('creates a poll in pending state when autoStart=false', () => {
-    const svc = new LivePollService();
-    const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Ready?',
-      options: ['Yes', 'No'],
-      autoStart: false,
-    });
-
-    expect(poll.status).toBe('pending');
-    expect(svc.getActivePollId('b1')).toBeNull();
-  });
-
-  it('starts a pending poll', () => {
-    const svc = new LivePollService();
-    const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Ready?',
-      options: ['Yes', 'No'],
-      autoStart: false,
-    });
-    const started = svc.startPoll(poll.id);
-    expect(started.status).toBe('active');
-    expect(svc.getActivePollId('b1')).toBe(poll.id);
-  });
-
-  it('rejects fewer than minOptions', () => {
-    const svc = new LivePollService();
-    expect(() =>
-      svc.createPoll({ broadcastId: 'b1', question: 'Q?', options: ['Only one'] }),
-    ).toThrow();
-  });
-
-  it('rejects more than maxOptions', () => {
-    const svc = new LivePollService({ maxOptions: 4 });
+  it('validates option count', () => {
+    const { svc } = createService();
     expect(() =>
       svc.createPoll({
-        broadcastId: 'b1',
+        broadcastId: 'b',
+        creatorId: 'c',
         question: 'Q?',
-        options: ['A', 'B', 'C', 'D', 'E'],
-      }),
-    ).toThrow();
+        options: [{ label: 'one' }],
+        durationMs: 30_000,
+      })
+    ).toThrow(/options must contain/);
+    expect(() =>
+      svc.createPoll({
+        broadcastId: 'b',
+        creatorId: 'c',
+        question: 'Q?',
+        options: Array.from({ length: 5 }, (_, i) => ({ label: `o${i}` })),
+        durationMs: 30_000,
+      })
+    ).toThrow(/options must contain/);
   });
 
-  it('rejects empty question', () => {
-    const svc = new LivePollService();
+  it('validates question and duration', () => {
+    const { svc } = createService();
     expect(() =>
-      svc.createPoll({ broadcastId: 'b1', question: '  ', options: ['A', 'B'] }),
-    ).toThrow();
+      svc.createPoll({
+        broadcastId: 'b',
+        creatorId: 'c',
+        question: '',
+        options: [{ label: 'a' }, { label: 'b' }],
+        durationMs: 30_000,
+      })
+    ).toThrow(/invalid question/);
+    expect(() =>
+      svc.createPoll({
+        broadcastId: 'b',
+        creatorId: 'c',
+        question: 'Q?',
+        options: [{ label: 'a' }, { label: 'b' }],
+        durationMs: 100,
+      })
+    ).toThrow(/durationMs/);
   });
 
-  it('rejects a second active poll for the same broadcast', () => {
-    const svc = new LivePollService();
-    svc.createPoll({ broadcastId: 'b1', question: 'Q1?', options: ['A', 'B'] });
+  it('rejects duplicate option labels', () => {
+    const { svc } = createService();
     expect(() =>
-      svc.createPoll({ broadcastId: 'b1', question: 'Q2?', options: ['X', 'Y'] }),
-    ).toThrow(/already has an active poll/);
+      svc.createPoll({
+        broadcastId: 'b',
+        creatorId: 'c',
+        question: 'Q?',
+        options: [{ label: 'A' }, { label: 'a' }],
+        durationMs: 30_000,
+      })
+    ).toThrow(/duplicate/);
   });
 });
 
-// ─── Voting ───────────────────────────────────────────────────────────────────
-
-describe('LivePollService — voting', () => {
-  it('accepts a valid vote', () => {
-    const svc = new LivePollService();
+describe('LivePollService.vote', () => {
+  it('records standard votes and prevents double-voting', () => {
+    const { svc } = createService();
     const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Best?',
-      options: ['Alpha', 'Beta'],
-    });
-    const optId = poll.options[0].id;
-    const result = svc.castVote({ pollId: poll.id, optionId: optId, userId: 'u1' });
-    expect(result.success).toBe(true);
-    expect(result.updatedOption?.voteCount).toBe(1);
-    expect(result.poll?.totalVotes).toBe(1);
-  });
-
-  it('prevents double-voting from the same user', () => {
-    const svc = new LivePollService();
-    const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Best?',
-      options: ['Alpha', 'Beta'],
-    });
-    const optId = poll.options[0].id;
-    svc.castVote({ pollId: poll.id, optionId: optId, userId: 'u1' });
-    const second = svc.castVote({ pollId: poll.id, optionId: optId, userId: 'u1' });
-    expect(second.success).toBe(false);
-    expect(second.reason).toMatch(/already voted/i);
-  });
-
-  it('rejects votes on unknown polls', () => {
-    const svc = new LivePollService();
-    const result = svc.castVote({ pollId: 'ghost', optionId: 'opt1', userId: 'u1' });
-    expect(result.success).toBe(false);
-    expect(result.reason).toMatch(/not found/i);
-  });
-
-  it('rejects votes on non-active polls', () => {
-    const svc = new LivePollService();
-    const poll = svc.createPoll({
-      broadcastId: 'b1',
+      broadcastId: 'b',
+      creatorId: 'c',
       question: 'Q?',
-      options: ['A', 'B'],
-      autoStart: false,
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 30_000,
     });
-    const result = svc.castVote({
-      pollId: poll.id,
-      optionId: poll.options[0].id,
-      userId: 'u1',
+    expect(svc.vote({ pollId: poll.id, userId: 'u1', optionId: 'opt_1' }).accepted).toBe(true);
+    const dup = svc.vote({ pollId: poll.id, userId: 'u1', optionId: 'opt_2' });
+    expect(dup.accepted).toBe(false);
+    expect(dup.reason).toBe('ALREADY_VOTED');
+  });
+
+  it('rejects invalid options & polls', () => {
+    const { svc } = createService();
+    expect(svc.vote({ pollId: 'nope', userId: 'u', optionId: 'opt_1' }).reason).toBe(
+      'POLL_NOT_FOUND'
+    );
+    const poll = svc.createPoll({
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 30_000,
     });
-    expect(result.success).toBe(false);
+    expect(svc.vote({ pollId: poll.id, userId: 'u', optionId: 'opt_99' }).reason).toBe(
+      'INVALID_OPTION'
+    );
+  });
+
+  it('auto-closes the poll when its expiry has passed', () => {
+    const { svc, clock } = createService();
+    const poll = svc.createPoll({
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 5_000,
+    });
+    clock.advance(6_000);
+    const r = svc.vote({ pollId: poll.id, userId: 'u', optionId: 'opt_1' });
+    expect(r.accepted).toBe(false);
+    expect(r.reason).toBe('POLL_CLOSED');
+    expect(svc.getPoll(poll.id)!.state).toBe('CLOSED');
+  });
+
+  it('PREDICTION mode requires valid stake within bounds', () => {
+    const { svc } = createService();
+    const poll = svc.createPoll({
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 30_000,
+      mode: 'PREDICTION',
+      minStake: 10,
+      maxStake: 1_000,
+    });
+    expect(svc.vote({ pollId: poll.id, userId: 'u', optionId: 'opt_1' }).reason).toBe(
+      'INVALID_STAKE'
+    );
+    expect(svc.vote({ pollId: poll.id, userId: 'u', optionId: 'opt_1', stake: 5 }).reason).toBe(
+      'INVALID_STAKE'
+    );
+    expect(
+      svc.vote({ pollId: poll.id, userId: 'u', optionId: 'opt_1', stake: 50 }).accepted
+    ).toBe(true);
   });
 });
 
-// ─── Prediction mode ──────────────────────────────────────────────────────────
-
-describe('LivePollService — prediction mode', () => {
-  it('requires a token wager in prediction mode', () => {
-    const svc = new LivePollService();
+describe('LivePollService snapshots and reveals', () => {
+  it('emits tally snapshots on tick and stops after close', () => {
+    const { svc, clock } = createService();
     const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Win?',
-      options: ['Yes', 'No'],
-      predictionMode: true,
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 30_000,
     });
-    const result = svc.castVote({
-      pollId: poll.id,
-      optionId: poll.options[0].id,
-      userId: 'u1',
-      tokensBet: 0,
-    });
-    expect(result.success).toBe(false);
-    expect(result.reason).toMatch(/wager/i);
+    const tallies: PollTally[] = [];
+    svc.subscribe(poll.id, (t) => tallies.push(t));
+    svc.vote({ pollId: poll.id, userId: 'u1', optionId: 'opt_1' });
+    svc.vote({ pollId: poll.id, userId: 'u2', optionId: 'opt_1' });
+    svc.vote({ pollId: poll.id, userId: 'u3', optionId: 'opt_2' });
+    svc.tick();
+    expect(tallies.length).toBeGreaterThan(0);
+    const last = tallies[tallies.length - 1];
+    expect(last.totalVotes).toBe(3);
+    expect(last.options[0].percent).toBeCloseTo((2 / 3) * 100);
+    expect(last.options[0].leading).toBe(true);
+
+    clock.advance(31_000);
+    svc.tick();
+    expect(svc.getPoll(poll.id)!.state).toBe('CLOSED');
   });
 
-  it('records token bets and computes payouts', () => {
-    const svc = new LivePollService();
+  it('reveal computes pari-mutuel payouts with house rake', () => {
+    const { svc } = createService();
     const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Win?',
-      options: ['Yes', 'No'],
-      predictionMode: true,
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'YES' }, { label: 'NO' }],
+      durationMs: 30_000,
+      mode: 'PREDICTION',
     });
-    const [yes, no] = poll.options;
-    svc.castVote({ pollId: poll.id, optionId: yes.id, userId: 'u1', tokensBet: 100 });
-    svc.castVote({ pollId: poll.id, optionId: no.id, userId: 'u2', tokensBet: 50 });
+    svc.vote({ pollId: poll.id, userId: 'w1', optionId: 'opt_1', stake: 100 });
+    svc.vote({ pollId: poll.id, userId: 'w2', optionId: 'opt_1', stake: 200 });
+    svc.vote({ pollId: poll.id, userId: 'l1', optionId: 'opt_2', stake: 700 });
 
-    svc.closePoll(poll.id);
-    // Poll transitions through 'revealing', give it a tick
-    const snap = svc.getSnapshot(poll.id);
-    expect(snap.winner).not.toBeNull();
-    // Total token pool is 150
-    expect(snap.tokenPayouts).not.toBeNull();
+    const reveals: RevealPayload[] = [];
+    svc.subscribeReveal(poll.id, (r) => reveals.push(r));
+    const reveal = svc.revealPoll(poll.id, 'opt_1');
+    expect(reveal.winningOptionId).toBe('opt_1');
+    expect(reveal.totalPayout).toBeGreaterThan(0);
+    expect(reveal.housePot).toBe(50); // 5% of 1000
+    const w1 = reveal.payouts.find((p) => p.userId === 'w1')!;
+    const w2 = reveal.payouts.find((p) => p.userId === 'w2')!;
+    const l1 = reveal.payouts.find((p) => p.userId === 'l1')!;
+    // Distributable = 950; w1 gets 100/300 = 316; w2 gets 200/300 = 633.
+    expect(w1.payout).toBe(316);
+    expect(w2.payout).toBe(633);
+    expect(l1.payout).toBe(0);
+    expect(l1.net).toBe(-700);
+    expect(reveals).toHaveLength(1);
+    expect(svc.getPoll(poll.id)!.state).toBe('REVEALED');
   });
-});
 
-// ─── Snapshot & history ───────────────────────────────────────────────────────
-
-describe('LivePollService — snapshot & history', () => {
-  it('computes correct percentages', () => {
-    const svc = new LivePollService();
+  it('archives revealed polls into history', () => {
+    const { svc } = createService();
     const poll = svc.createPoll({
-      broadcastId: 'b1',
-      question: 'Fav?',
-      options: ['A', 'B', 'C'],
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 30_000,
     });
-    const [a, b, c] = poll.options;
-    svc.castVote({ pollId: poll.id, optionId: a.id, userId: 'u1' });
-    svc.castVote({ pollId: poll.id, optionId: a.id, userId: 'u2' });
-    svc.castVote({ pollId: poll.id, optionId: b.id, userId: 'u3' });
-    svc.castVote({ pollId: poll.id, optionId: c.id, userId: 'u4' });
-
-    const snap = svc.getSnapshot(poll.id);
-    expect(snap.percentages[a.id]).toBe(50);
-    expect(snap.percentages[b.id]).toBe(25);
-    expect(snap.percentages[c.id]).toBe(25);
+    svc.vote({ pollId: poll.id, userId: 'u1', optionId: 'opt_1' });
+    svc.revealPoll(poll.id);
+    const hist = svc.history_for('b');
+    expect(hist).toHaveLength(1);
+    expect(hist[0].reveal.winningOptionId).toBe('opt_1');
   });
 
-  it('surfaces history sorted newest-first', () => {
-    const svc = new LivePollService();
-    const p1 = svc.createPoll({ broadcastId: 'b1', question: 'Q1', options: ['A', 'B'] });
-    svc.closePoll(p1.id);
-    const p2 = svc.createPoll({ broadcastId: 'b1', question: 'Q2', options: ['X', 'Y'] });
-
-    const history = svc.getPollHistory('b1');
-    expect(history[0].id).toBe(p2.id);
-    expect(history[1].id).toBe(p1.id);
-  });
-
-  it('deletes a poll cleanly', () => {
-    const svc = new LivePollService();
-    const poll = svc.createPoll({ broadcastId: 'b1', question: 'Q?', options: ['A', 'B'] });
-    svc.closePoll(poll.id);
-    svc.deletePoll(poll.id);
-    expect(svc.getPollHistory('b1')).toHaveLength(0);
-  });
-});
-
-// ─── Events ───────────────────────────────────────────────────────────────────
-
-describe('LivePollService — events', () => {
-  it('emits poll:created on creation', () => {
-    const svc = new LivePollService();
-    const events: unknown[] = [];
-    svc.on('poll:created', (p) => events.push(p));
-    svc.createPoll({ broadcastId: 'b1', question: 'Q?', options: ['A', 'B'] });
-    expect(events).toHaveLength(1);
-  });
-
-  it('emits poll:vote on each accepted vote', () => {
-    const svc = new LivePollService();
-    const votes: unknown[] = [];
-    svc.on('poll:vote', (v) => votes.push(v));
-    const poll = svc.createPoll({ broadcastId: 'b1', question: 'Q?', options: ['A', 'B'] });
-    svc.castVote({ pollId: poll.id, optionId: poll.options[0].id, userId: 'u1' });
-    svc.castVote({ pollId: poll.id, optionId: poll.options[1].id, userId: 'u2' });
-    expect(votes).toHaveLength(2);
+  it('reveal is idempotent', () => {
+    const { svc } = createService();
+    const poll = svc.createPoll({
+      broadcastId: 'b',
+      creatorId: 'c',
+      question: 'Q?',
+      options: [{ label: 'A' }, { label: 'B' }],
+      durationMs: 30_000,
+    });
+    svc.vote({ pollId: poll.id, userId: 'u1', optionId: 'opt_1' });
+    const first = svc.revealPoll(poll.id);
+    const second = svc.revealPoll(poll.id);
+    expect(second).toBe(first);
   });
 });

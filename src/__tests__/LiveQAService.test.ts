@@ -1,266 +1,195 @@
-import { LiveQAService, resetLiveQAService } from '../services/LiveQAService';
+import { LiveQAService } from '../services/LiveQAService';
 
-beforeEach(() => {
-  resetLiveQAService();
-});
+class ManualClock {
+  current = 5_000_000;
+  now(): number {
+    return this.current;
+  }
+  advance(ms: number): void {
+    this.current += ms;
+  }
+}
 
-afterEach(() => {
-  resetLiveQAService();
-});
+let counter = 0;
+const idFactory = () => `q_${++counter}`;
 
-// ─── Question submission ──────────────────────────────────────────────────────
+function createService(opts: Partial<{ clock: ManualClock; perUserPerMinute: number }> = {}) {
+  counter = 0;
+  const clock = opts.clock ?? new ManualClock();
+  return {
+    svc: new LiveQAService({
+      clock,
+      idFactory,
+      perUserPerMinute: opts.perUserPerMinute ?? 5,
+    }),
+    clock,
+  };
+}
 
-describe('LiveQAService — question submission', () => {
-  it('accepts a valid question', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
+describe('LiveQAService.submit', () => {
+  it('accepts valid questions and returns frozen entity', () => {
+    const { svc, clock } = createService();
+    const r = svc.submit({
       broadcastId: 'b1',
       authorId: 'u1',
       authorDisplayName: 'Alice',
-      text: 'What is alpha decay?',
+      body: 'What is the meaning of life?',
     });
-
-    expect(q.id).toBeTruthy();
-    expect(q.status).toBe('pending');
-    expect(q.upvotes).toBe(0);
-    expect(q.pinned).toBe(false);
-    expect(svc.getQuestionCount('b1')).toBe(1);
+    expect(r.accepted).toBe(true);
+    expect(r.question!.id).toBe('q_1');
+    expect(r.question!.upvotes).toBe(0);
+    expect(r.question!.state).toBe('OPEN');
+    expect(r.question!.pinned).toBe(false);
+    expect(r.question!.createdAt.getTime()).toBe(clock.now());
+    expect(Object.isFrozen(r.question)).toBe(true);
   });
 
-  it('rejects empty question text', () => {
-    const svc = new LiveQAService();
-    expect(() =>
-      svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: '' }),
-    ).toThrow();
+  it('rejects malformed input', () => {
+    const { svc } = createService();
+    expect(svc.submit({ broadcastId: '', authorId: 'u', authorDisplayName: 'a', body: 'hi there' }).reason).toBe('INVALID_BROADCAST');
+    expect(svc.submit({ broadcastId: 'b', authorId: '', authorDisplayName: 'a', body: 'hi there' }).reason).toBe('INVALID_USER');
+    expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: '', body: 'hi there' }).reason).toBe('INVALID_USER');
+    expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 'hi' }).reason).toBe('INVALID_BODY');
+    expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 'x'.repeat(500) }).reason).toBe('INVALID_BODY');
+    expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 123 as unknown as string }).reason).toBe('INVALID_BODY');
   });
 
-  it('rejects questions exceeding max length', () => {
-    const svc = new LiveQAService({ maxQuestionLength: 50 });
-    expect(() =>
-      svc.submitQuestion({
-        broadcastId: 'b1',
-        authorId: 'u1',
-        authorDisplayName: 'A',
-        text: 'x'.repeat(51),
-      }),
-    ).toThrow(/exceeds maximum length/i);
-  });
-
-  it('enforces per-user question cap', () => {
-    const svc = new LiveQAService({ maxQuestionsPerUser: 2 });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q1?' });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q2?' });
-    expect(() =>
-      svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q3?' }),
-    ).toThrow(/maximum.*questions/i);
-  });
-
-  it('allows different users to submit independently', () => {
-    const svc = new LiveQAService({ maxQuestionsPerUser: 1 });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?' });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u2', authorDisplayName: 'B', text: 'Q?' });
-    expect(svc.getQuestionCount('b1')).toBe(2);
-  });
-
-  it('enforces broadcast-level question cap', () => {
-    const svc = new LiveQAService({ maxQuestionsPerBroadcast: 3, maxQuestionsPerUser: 100 });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q1?' });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u2', authorDisplayName: 'B', text: 'Q2?' });
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u3', authorDisplayName: 'C', text: 'Q3?' });
-    expect(() =>
-      svc.submitQuestion({ broadcastId: 'b1', authorId: 'u4', authorDisplayName: 'D', text: 'Q4?' }),
-    ).toThrow(/maximum question limit/i);
-  });
-});
-
-// ─── Upvoting ─────────────────────────────────────────────────────────────────
-
-describe('LiveQAService — upvoting', () => {
-  it('increments vote count', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
+  it('strips control / bidi / zero-width characters before validating', () => {
+    const { svc } = createService();
+    const r = svc.submit({
+      broadcastId: 'b',
+      authorId: 'u',
+      authorDisplayName: 'Alice',
+      body: 'Hello\u202E\u200B world  question?',
     });
-    const result = svc.upvoteQuestion(q.id, 'voter1');
-    expect(result.success).toBe(true);
-    expect(result.newUpvotes).toBe(1);
+    expect(r.accepted).toBe(true);
+    expect(r.question!.body).toBe('Hello world question?');
   });
 
-  it('prevents duplicate upvotes from the same user', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
-    });
-    svc.upvoteQuestion(q.id, 'voter1');
-    const dup = svc.upvoteQuestion(q.id, 'voter1');
-    expect(dup.success).toBe(false);
-    expect(dup.reason).toMatch(/already upvoted/i);
-  });
-
-  it('returns failure for unknown question', () => {
-    const svc = new LiveQAService();
-    const result = svc.upvoteQuestion('nonexistent', 'voter1');
-    expect(result.success).toBe(false);
-    expect(result.reason).toMatch(/not found/i);
-  });
-
-  it('rejects upvotes on dismissed questions', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
-    });
-    svc.dismissQuestion(q.id);
-    const result = svc.upvoteQuestion(q.id, 'voter1');
-    expect(result.success).toBe(false);
-    expect(result.reason).toMatch(/dismissed/i);
-  });
-});
-
-// ─── Broadcaster controls ─────────────────────────────────────────────────────
-
-describe('LiveQAService — broadcaster controls', () => {
-  it('marks a question as answered with timestamp', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
-    });
-    const answered = svc.markAnswered(q.id);
-    expect(answered.status).toBe('answered');
-    expect(answered.answeredAt).not.toBeNull();
-  });
-
-  it('throws when marking an already-answered question', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
-    });
-    svc.markAnswered(q.id);
-    expect(() => svc.markAnswered(q.id)).toThrow(/already answered/i);
-  });
-
-  it('dismisses a question', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
-    });
-    svc.dismissQuestion(q.id);
-    const retrieved = svc.getQuestion(q.id);
-    expect(retrieved?.status).toBe('dismissed');
-  });
-
-  it('pins and unpins a question', () => {
-    const svc = new LiveQAService();
-    const q = svc.submitQuestion({
-      broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?',
-    });
-    svc.pinQuestion(q.id);
-    expect(svc.getQuestion(q.id)?.pinned).toBe(true);
-    svc.unpinQuestion(q.id);
-    expect(svc.getQuestion(q.id)?.pinned).toBe(false);
-  });
-});
-
-// ─── Query / sorting ──────────────────────────────────────────────────────────
-
-describe('LiveQAService — query & sorting', () => {
-  it('returns questions sorted by upvotes descending', () => {
-    const svc = new LiveQAService({ maxQuestionsPerUser: 10 });
-    const q1 = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Low votes' });
-    const q2 = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u2', authorDisplayName: 'B', text: 'High votes' });
-
-    svc.upvoteQuestion(q2.id, 'v1');
-    svc.upvoteQuestion(q2.id, 'v2');
-    svc.upvoteQuestion(q1.id, 'v3');
-
-    const list = svc.getQuestions('b1');
-    expect(list[0].id).toBe(q2.id);
-    expect(list[1].id).toBe(q1.id);
-  });
-
-  it('pins bubble pinned questions to the top', () => {
-    const svc = new LiveQAService({ maxQuestionsPerUser: 10 });
-    const q1 = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q1?' });
-    const q2 = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u2', authorDisplayName: 'B', text: 'Q2 (pinned)' });
-
-    svc.upvoteQuestion(q1.id, 'v1');
-    svc.upvoteQuestion(q1.id, 'v2'); // q1 has more votes but q2 is pinned
-    svc.pinQuestion(q2.id);
-
-    const list = svc.getQuestions('b1', { pinnedFirst: true });
-    expect(list[0].id).toBe(q2.id);
-  });
-
-  it('filters by status', () => {
-    const svc = new LiveQAService({ maxQuestionsPerUser: 10 });
-    const q1 = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q1?' });
-    const q2 = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u2', authorDisplayName: 'B', text: 'Q2?' });
-    svc.markAnswered(q1.id);
-
-    const pending = svc.getQuestions('b1', { status: 'pending' });
-    expect(pending.map((q) => q.id)).not.toContain(q1.id);
-    expect(pending.map((q) => q.id)).toContain(q2.id);
-  });
-
-  it('honours the limit parameter', () => {
-    const svc = new LiveQAService({ maxQuestionsPerUser: 10 });
-    for (let i = 0; i < 10; i++) {
-      svc.submitQuestion({
-        broadcastId: 'b1',
-        authorId: `u${i}`,
-        authorDisplayName: `User ${i}`,
-        text: `Question ${i}?`,
-      });
+  it('throttles >5 questions/minute per user', () => {
+    const { svc, clock } = createService({ perUserPerMinute: 3 });
+    for (let i = 0; i < 3; i++) {
+      expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: `question number ${i}` }).accepted).toBe(true);
     }
-    const limited = svc.getQuestions('b1', { limit: 3 });
-    expect(limited).toHaveLength(3);
+    const r = svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 'fourth question' });
+    expect(r.reason).toBe('THROTTLED');
+    clock.advance(60_001);
+    expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 'after window' }).accepted).toBe(true);
+  });
+
+  it('rejects duplicate body within window', () => {
+    const { svc } = createService();
+    expect(svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 'Same question?' }).accepted).toBe(true);
+    const dup = svc.submit({ broadcastId: 'b', authorId: 'u', authorDisplayName: 'a', body: 'same question?' });
+    expect(dup.reason).toBe('DUPLICATE');
   });
 });
 
-// ─── Broadcast cleanup ────────────────────────────────────────────────────────
+describe('LiveQAService.upvote', () => {
+  it('records and removes upvotes; one per user; not from author', () => {
+    const { svc } = createService();
+    const submitted = svc.submit({
+      broadcastId: 'b',
+      authorId: 'author',
+      authorDisplayName: 'A',
+      body: 'Great question?',
+    });
+    const id = submitted.question!.id;
 
-describe('LiveQAService — broadcast cleanup', () => {
-  it('clears all questions for a broadcast', () => {
-    const svc = new LiveQAService();
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?' });
-    svc.clearBroadcast('b1');
-    expect(svc.getQuestionCount('b1')).toBe(0);
-  });
+    expect(svc.upvote({ questionId: 'nope', userId: 'u' }).reason).toBe('NOT_FOUND');
+    expect(svc.upvote({ questionId: id, userId: '' }).reason).toBe('INVALID_USER');
+    expect(svc.upvote({ questionId: id, userId: 'author' }).reason).toBe('ALREADY_VOTED');
 
-  it('does not affect other broadcasts', () => {
-    const svc = new LiveQAService();
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?' });
-    svc.submitQuestion({ broadcastId: 'b2', authorId: 'u2', authorDisplayName: 'B', text: 'Q?' });
-    svc.clearBroadcast('b1');
-    expect(svc.getQuestionCount('b2')).toBe(1);
+    const v1 = svc.upvote({ questionId: id, userId: 'u1' });
+    expect(v1.accepted).toBe(true);
+    expect(v1.question!.upvotes).toBe(1);
+    expect(svc.upvote({ questionId: id, userId: 'u1' }).reason).toBe('ALREADY_VOTED');
+
+    const v2 = svc.upvote({ questionId: id, userId: 'u2' });
+    expect(v2.question!.upvotes).toBe(2);
+
+    const undo = svc.removeUpvote({ questionId: id, userId: 'u2' });
+    expect(undo.accepted).toBe(true);
+    expect(undo.question!.upvotes).toBe(1);
+    expect(svc.removeUpvote({ questionId: id, userId: 'u3' }).reason).toBe('NOT_VOTED');
   });
 });
 
-// ─── Events ───────────────────────────────────────────────────────────────────
-
-describe('LiveQAService — events', () => {
-  it('emits question:submitted on new question', () => {
-    const svc = new LiveQAService();
-    const events: unknown[] = [];
-    svc.on('question:submitted', (q) => events.push(q));
-    svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?' });
-    expect(events).toHaveLength(1);
+describe('LiveQAService broadcaster controls', () => {
+  it('markAnswered sets state, timestamp, and unpins', () => {
+    const { svc, clock } = createService();
+    const q = svc.submit({ broadcastId: 'b', authorId: 'a', authorDisplayName: 'a', body: 'test question?' }).question!;
+    svc.pin(q.id);
+    clock.advance(1_000);
+    const updated = svc.markAnswered(q.id)!;
+    expect(updated.state).toBe('ANSWERED');
+    expect(updated.pinned).toBe(false);
+    expect(updated.answeredAt!.getTime()).toBe(clock.now());
+    // idempotent
+    expect(svc.markAnswered(q.id)!.answeredAt!.getTime()).toBe(clock.now());
   });
 
-  it('emits question:upvoted on successful upvote', () => {
-    const svc = new LiveQAService();
-    const events: unknown[] = [];
-    svc.on('question:upvoted', (e) => events.push(e));
-    const q = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?' });
-    svc.upvoteQuestion(q.id, 'voter1');
-    expect(events).toHaveLength(1);
+  it('pin / unpin toggles correctly', () => {
+    const { svc } = createService();
+    const q = svc.submit({ broadcastId: 'b', authorId: 'a', authorDisplayName: 'a', body: 'pin me question?' }).question!;
+    expect(svc.pin(q.id)!.pinned).toBe(true);
+    expect(svc.pin(q.id)!.pinned).toBe(true);
+    expect(svc.unpin(q.id)!.pinned).toBe(false);
+    expect(svc.unpin('missing')).toBeNull();
   });
 
-  it('emits question:answered when broadcaster marks answered', () => {
-    const svc = new LiveQAService();
-    const events: unknown[] = [];
-    svc.on('question:answered', (q) => events.push(q));
-    const q = svc.submitQuestion({ broadcastId: 'b1', authorId: 'u1', authorDisplayName: 'A', text: 'Q?' });
-    svc.markAnswered(q.id);
-    expect(events).toHaveLength(1);
+  it('hide moves to HIDDEN and excludes from listings', () => {
+    const { svc } = createService();
+    const q = svc.submit({ broadcastId: 'b', authorId: 'a', authorDisplayName: 'a', body: 'hide me question?' }).question!;
+    svc.hide(q.id);
+    const snap = svc.list('b');
+    expect(snap.open).toHaveLength(0);
+    expect(snap.pinned).toHaveLength(0);
+    expect(snap.answered).toHaveLength(0);
+    expect(snap.totalQuestions).toBe(1);
+  });
+});
+
+describe('LiveQAService listings & subscriptions', () => {
+  it('panel returns pinned first, then OPEN by score; ANSWERED separated', () => {
+    const { svc } = createService();
+    const a = svc.submit({ broadcastId: 'b', authorId: 'a', authorDisplayName: 'a', body: 'first question?' }).question!;
+    const b = svc.submit({ broadcastId: 'b', authorId: 'b', authorDisplayName: 'b', body: 'second question?' }).question!;
+    const c = svc.submit({ broadcastId: 'b', authorId: 'c', authorDisplayName: 'c', body: 'third question?' }).question!;
+
+    svc.upvote({ questionId: a.id, userId: 'x1' });
+    svc.upvote({ questionId: a.id, userId: 'x2' });
+    svc.upvote({ questionId: b.id, userId: 'y1' });
+    svc.pin(c.id);
+
+    const panel = svc.panel('b');
+    expect(panel[0].id).toBe(c.id);
+    expect(panel[1].id).toBe(a.id);
+    expect(panel[2].id).toBe(b.id);
+
+    svc.markAnswered(a.id);
+    const snap = svc.list('b');
+    expect(snap.answered.map((q) => q.id)).toEqual([a.id]);
+    expect(snap.open.map((q) => q.id)).toEqual([b.id]);
+    expect(snap.totalUpvotes).toBe(3);
+  });
+
+  it('subscribers receive snapshots on submit/upvote and stop after closeBroadcast', () => {
+    const { svc } = createService();
+    const received: number[] = [];
+    svc.subscribe('b', (snap) => received.push(snap.totalQuestions));
+    svc.submit({ broadcastId: 'b', authorId: 'a', authorDisplayName: 'A', body: 'hello world?' });
+    expect(received).toEqual([1]);
+
+    svc.closeBroadcast('b');
+    svc.submit({ broadcastId: 'b', authorId: 'a', authorDisplayName: 'A', body: 'after close?' });
+    expect(received).toEqual([1]);
+    expect(svc.get('q_1')).toBeNull();
+  });
+
+  it('get returns null for missing ids', () => {
+    const { svc } = createService();
+    expect(svc.get('')).toBeNull();
+    expect(svc.get('missing')).toBeNull();
   });
 });

@@ -1,342 +1,524 @@
-import { EventEmitter } from 'events';
 import logger from '../lib/logger';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+/**
+ * LiveQAService — Crowd-Sourced Q&A Overlay for Live Broadcasts
+ * =============================================================
+ *
+ * During a live broadcast viewers post questions; everyone else upvotes
+ * the questions they want answered; the broadcaster sees a list sorted
+ * by net upvotes (with pinned questions always on top) and marks
+ * questions as ANSWERED once they have addressed them on-air.
+ *
+ * Functional requirements (issue #21):
+ *
+ *   - Submit questions (length-bounded, throttled per-user).
+ *   - Upvote / undo upvote (one vote per user per question).
+ *   - Sort by popularity for the broadcaster panel.
+ *   - "Answered" state with timestamp.
+ *   - Pin important questions to top.
+ *
+ * Implementation notes:
+ *
+ *   - Single in-memory store keyed by broadcastId; a real deployment
+ *     would persist to Postgres but the public surface is stable so
+ *     swapping the backend later is a one-file change.
+ *   - All time-sensitive logic uses an injectable Clock so the service
+ *     is fully deterministic under Jest.
+ *   - Every mutation method returns the freshly-rendered question (or
+ *     null on failure) so HTTP handlers don't have to do a follow-up
+ *     read.
+ *   - A snapshot listener mechanism mirrors ReactionEngine /
+ *     LivePollService so the WebSocket bridge can fan out the
+ *     broadcaster panel without polling.
+ */
 
-export type QuestionStatus = 'pending' | 'answered' | 'dismissed';
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type QuestionState = 'OPEN' | 'ANSWERED' | 'HIDDEN';
 
 export interface Question {
-  id: string;
-  broadcastId: string;
-  authorId: string;
-  authorDisplayName: string;
-  text: string;
-  upvotes: number;
-  status: QuestionStatus;
-  pinned: boolean;
-  createdAt: number;
-  answeredAt: number | null;
+  readonly id: string;
+  readonly broadcastId: string;
+  readonly authorId: string;
+  readonly authorDisplayName: string;
+  readonly body: string;
+  readonly upvotes: number;
+  readonly state: QuestionState;
+  readonly pinned: boolean;
+  readonly createdAt: Date;
+  readonly answeredAt: Date | null;
+  readonly hiddenAt: Date | null;
+  readonly score: number;          // popularity score, used for sorting
+}
+
+export interface SubmitInput {
+  readonly broadcastId: string;
+  readonly authorId: string;
+  readonly authorDisplayName: string;
+  readonly body: string;
+}
+
+export interface SubmitResult {
+  readonly accepted: boolean;
+  readonly reason?:
+    | 'OK'
+    | 'INVALID_BODY'
+    | 'INVALID_USER'
+    | 'INVALID_BROADCAST'
+    | 'THROTTLED'
+    | 'DUPLICATE';
+  readonly question?: Question;
+}
+
+export interface UpvoteInput {
+  readonly questionId: string;
+  readonly userId: string;
 }
 
 export interface UpvoteResult {
-  success: boolean;
-  reason?: string;
-  newUpvotes?: number;
+  readonly accepted: boolean;
+  readonly reason?:
+    | 'OK'
+    | 'NOT_FOUND'
+    | 'ALREADY_VOTED'
+    | 'NOT_VOTED'
+    | 'INVALID_USER';
+  readonly question?: Question;
 }
 
-export interface QuestionListOptions {
-  /** Include questions with this status (default: all) */
-  status?: QuestionStatus | 'all';
-  /** Include pinned questions at the top (default: true) */
-  pinnedFirst?: boolean;
-  /** Max results to return (default: 100) */
-  limit?: number;
+export interface QuestionListSnapshot {
+  readonly broadcastId: string;
+  readonly pinned: ReadonlyArray<Question>;
+  readonly open: ReadonlyArray<Question>;
+  readonly answered: ReadonlyArray<Question>;
+  readonly totalQuestions: number;
+  readonly totalUpvotes: number;
+  readonly generatedAt: Date;
 }
 
-export interface LiveQAServiceConfig {
-  /** Maximum character length of a question (default: 280) */
-  maxQuestionLength?: number;
-  /** Maximum number of questions per broadcast kept in memory (default: 1000) */
-  maxQuestionsPerBroadcast?: number;
-  /** Max questions a single user can submit per broadcast (default: 5) */
-  maxQuestionsPerUser?: number;
+export type QASnapshotListener = (snapshot: QuestionListSnapshot) => void;
+
+export interface LiveQAServiceOptions {
+  readonly clock?: ClockApi;
+  readonly idFactory?: () => string;
+  readonly perUserPerMinute?: number;
+  readonly maxBodyLength?: number;
+  readonly minBodyLength?: number;
+  readonly maxQuestionsPerBroadcast?: number;
+  readonly duplicateWindowMs?: number;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-let _qIdCounter = 0;
-
-function generateQuestionId(): string {
-  _qIdCounter = (_qIdCounter + 1) % Number.MAX_SAFE_INTEGER;
-  return `qa_${Date.now()}_${_qIdCounter}`;
+export interface ClockApi {
+  now(): number;
 }
 
-// ─── LiveQAService ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
 
-/**
- * LiveQAService manages real-time Q&A queues for live broadcasts.
- *
- * Features:
- *  - Viewers submit questions (character-limited, per-user rate cap).
- *  - Upvote system surfaces the most popular questions to the top.
- *  - Broadcaster can mark questions as answered (with timestamp) or dismissed.
- *  - Pin important questions to the top of the queue regardless of vote count.
- *  - Query API returns questions sorted by: pinned → upvotes → recency.
- *  - Full history of all questions is preserved per broadcast.
- */
-export class LiveQAService extends EventEmitter {
-  private readonly maxQuestionLength: number;
+const DEFAULT_PER_USER_PER_MINUTE = 5;
+const DEFAULT_MAX_BODY_LENGTH = 280;
+const DEFAULT_MIN_BODY_LENGTH = 5;
+const DEFAULT_MAX_QUESTIONS_PER_BROADCAST = 5_000;
+const DEFAULT_DUPLICATE_WINDOW_MS = 60_000;
+
+const realClock: ClockApi = { now: () => Date.now() };
+
+function defaultIdFactory(): string {
+  return `qa_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function sanitiseBody(value: unknown, min: number, max: number): string | null {
+  if (typeof value !== 'string') return null;
+  // Strip control chars and collapse whitespace to a single space; we
+  // explicitly do NOT escape HTML — that's the renderer's job.  We do
+  // refuse zero-width, BOM and bidi-override characters so screens
+  // can't be tricked into rendering misleading questions.
+  let cleaned = '';
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x20 || code === 0x7f) continue;
+    if (code >= 0x80 && code <= 0x9f) continue;
+    if (code === 0x200b || code === 0x200c || code === 0x200d) continue;
+    if (code === 0xfeff) continue;
+    if (code === 0x202a || code === 0x202b || code === 0x202c || code === 0x202d || code === 0x202e) continue;
+    cleaned += ch;
+  }
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+  if (cleaned.length < min || cleaned.length > max) return null;
+  return cleaned;
+}
+
+function sanitiseShortString(value: unknown, max: number): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > max) return null;
+  return trimmed;
+}
+
+// Pinned questions get a huge score boost so they always float to the
+// top of the broadcaster panel; tied questions break by recency so the
+// broadcaster sees the freshest popular questions first.
+function computeScore(q: { upvotes: number; pinned: boolean; createdAt: Date }): number {
+  const base = q.upvotes;
+  const recency = Math.floor(q.createdAt.getTime() / 1_000); // seconds, for sub-vote tie-break
+  const pinBonus = q.pinned ? 1_000_000 : 0;
+  // Multiply upvotes by 10_000 so they always dominate the recency tie-break.
+  return pinBonus + base * 10_000 + (recency % 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// Internal state
+// ---------------------------------------------------------------------------
+
+interface BroadcastQAState {
+  readonly broadcastId: string;
+  readonly questions: Map<string, Question>;
+  readonly upvoteRegistry: Map<string, Set<string>>; // questionId → voterIds
+  readonly userTimestamps: Map<string, number[]>;
+  readonly recentBodies: Map<string, number>;        // hash → first-seen ms
+  readonly listeners: Set<QASnapshotListener>;
+}
+
+// ---------------------------------------------------------------------------
+// Service implementation
+// ---------------------------------------------------------------------------
+
+export class LiveQAService {
+  private readonly clock: ClockApi;
+  private readonly idFactory: () => string;
+  private readonly perUserPerMinute: number;
+  private readonly maxBodyLength: number;
+  private readonly minBodyLength: number;
   private readonly maxQuestionsPerBroadcast: number;
-  private readonly maxQuestionsPerUser: number;
+  private readonly duplicateWindowMs: number;
 
-  /** broadcastId → list of questions */
-  private readonly questions = new Map<string, Question[]>();
+  private readonly broadcasts = new Map<string, BroadcastQAState>();
 
-  /** userId:broadcastId → number of questions submitted */
-  private readonly submissionCounts = new Map<string, number>();
-
-  /** userId:questionId → true (prevents double upvoting) */
-  private readonly upvoteRecord = new Set<string>();
-
-  constructor(config: LiveQAServiceConfig = {}) {
-    super();
-    this.maxQuestionLength = config.maxQuestionLength ?? 280;
-    this.maxQuestionsPerBroadcast = config.maxQuestionsPerBroadcast ?? 1_000;
-    this.maxQuestionsPerUser = config.maxQuestionsPerUser ?? 5;
+  constructor(options: LiveQAServiceOptions = {}) {
+    this.clock = options.clock ?? realClock;
+    this.idFactory = options.idFactory ?? defaultIdFactory;
+    this.perUserPerMinute = options.perUserPerMinute ?? DEFAULT_PER_USER_PER_MINUTE;
+    this.maxBodyLength = options.maxBodyLength ?? DEFAULT_MAX_BODY_LENGTH;
+    this.minBodyLength = options.minBodyLength ?? DEFAULT_MIN_BODY_LENGTH;
+    this.maxQuestionsPerBroadcast =
+      options.maxQuestionsPerBroadcast ?? DEFAULT_MAX_QUESTIONS_PER_BROADCAST;
+    this.duplicateWindowMs = options.duplicateWindowMs ?? DEFAULT_DUPLICATE_WINDOW_MS;
   }
 
-  // ── Viewer API ─────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
+  // Submission
+  // -------------------------------------------------------------------------
 
-  /**
-   * Submit a new question to the Q&A queue.
-   */
-  submitQuestion(params: {
-    broadcastId: string;
-    authorId: string;
-    authorDisplayName: string;
-    text: string;
-  }): Question {
-    const { broadcastId, authorId, authorDisplayName, text } = params;
-
-    const trimmed = text.trim();
-    if (!trimmed) {
-      throw new Error('Question text cannot be empty');
+  submit(input: SubmitInput): SubmitResult {
+    if (typeof input.broadcastId !== 'string' || input.broadcastId.length === 0) {
+      return { accepted: false, reason: 'INVALID_BROADCAST' };
     }
-    if (trimmed.length > this.maxQuestionLength) {
-      throw new Error(
-        `Question exceeds maximum length of ${this.maxQuestionLength} characters`,
-      );
+    if (typeof input.authorId !== 'string' || input.authorId.length === 0) {
+      return { accepted: false, reason: 'INVALID_USER' };
     }
+    const displayName = sanitiseShortString(input.authorDisplayName, 80);
+    if (displayName === null) return { accepted: false, reason: 'INVALID_USER' };
 
-    const broadcastQuestions = this.questions.get(broadcastId) ?? [];
-    if (broadcastQuestions.length >= this.maxQuestionsPerBroadcast) {
-      throw new Error(
-        `Broadcast ${broadcastId} has reached the maximum question limit`,
-      );
+    const body = sanitiseBody(input.body, this.minBodyLength, this.maxBodyLength);
+    if (body === null) return { accepted: false, reason: 'INVALID_BODY' };
+
+    const state = this.ensureState(input.broadcastId);
+    if (state.questions.size >= this.maxQuestionsPerBroadcast) {
+      return { accepted: false, reason: 'THROTTLED' };
     }
-
-    const countKey = `${authorId}:${broadcastId}`;
-    const currentCount = this.submissionCounts.get(countKey) ?? 0;
-    if (currentCount >= this.maxQuestionsPerUser) {
-      throw new Error(
-        `User ${authorId} has reached the maximum of ${this.maxQuestionsPerUser} questions per broadcast`,
-      );
+    const now = this.clock.now();
+    if (!this.passesUserThrottle(state, input.authorId, now)) {
+      return { accepted: false, reason: 'THROTTLED' };
+    }
+    if (!this.passesDuplicateGuard(state, input.authorId, body, now)) {
+      return { accepted: false, reason: 'DUPLICATE' };
     }
 
-    const question: Question = {
-      id: generateQuestionId(),
-      broadcastId,
-      authorId,
-      authorDisplayName: authorDisplayName.trim() || 'Anonymous',
-      text: trimmed,
+    const id = this.idFactory();
+    const question: Question = Object.freeze({
+      id,
+      broadcastId: input.broadcastId,
+      authorId: input.authorId,
+      authorDisplayName: displayName,
+      body,
       upvotes: 0,
-      status: 'pending',
+      state: 'OPEN',
       pinned: false,
-      createdAt: Date.now(),
+      createdAt: new Date(now),
       answeredAt: null,
+      hiddenAt: null,
+      score: computeScore({ upvotes: 0, pinned: false, createdAt: new Date(now) }),
+    });
+    state.questions.set(id, question);
+    state.upvoteRegistry.set(id, new Set());
+    this.broadcastSnapshot(state);
+    return { accepted: true, reason: 'OK', question };
+  }
+
+  // -------------------------------------------------------------------------
+  // Upvoting
+  // -------------------------------------------------------------------------
+
+  upvote(input: UpvoteInput): UpvoteResult {
+    const { state, question } = this.lookup(input.questionId);
+    if (!state || !question) return { accepted: false, reason: 'NOT_FOUND' };
+    if (typeof input.userId !== 'string' || input.userId.length === 0) {
+      return { accepted: false, reason: 'INVALID_USER' };
+    }
+    if (input.userId === question.authorId) {
+      // Authors cannot upvote their own questions; treat as a duplicate
+      // vote rather than an error so the UI just silently no-ops.
+      return { accepted: false, reason: 'ALREADY_VOTED' };
+    }
+    const voters = state.upvoteRegistry.get(question.id)!;
+    if (voters.has(input.userId)) return { accepted: false, reason: 'ALREADY_VOTED' };
+    voters.add(input.userId);
+    const updated = this.recompute(question, { upvotes: question.upvotes + 1 });
+    state.questions.set(updated.id, updated);
+    this.broadcastSnapshot(state);
+    return { accepted: true, reason: 'OK', question: updated };
+  }
+
+  removeUpvote(input: UpvoteInput): UpvoteResult {
+    const { state, question } = this.lookup(input.questionId);
+    if (!state || !question) return { accepted: false, reason: 'NOT_FOUND' };
+    if (typeof input.userId !== 'string' || input.userId.length === 0) {
+      return { accepted: false, reason: 'INVALID_USER' };
+    }
+    const voters = state.upvoteRegistry.get(question.id)!;
+    if (!voters.has(input.userId)) return { accepted: false, reason: 'NOT_VOTED' };
+    voters.delete(input.userId);
+    const updated = this.recompute(question, { upvotes: Math.max(0, question.upvotes - 1) });
+    state.questions.set(updated.id, updated);
+    this.broadcastSnapshot(state);
+    return { accepted: true, reason: 'OK', question: updated };
+  }
+
+  // -------------------------------------------------------------------------
+  // Broadcaster controls — answer / pin / hide
+  // -------------------------------------------------------------------------
+
+  markAnswered(questionId: string): Question | null {
+    const { state, question } = this.lookup(questionId);
+    if (!state || !question) return null;
+    if (question.state === 'ANSWERED') return question;
+    const updated = this.recompute(question, {
+      state: 'ANSWERED',
+      answeredAt: new Date(this.clock.now()),
+      pinned: false, // un-pin once answered so new questions can surface
+    });
+    state.questions.set(updated.id, updated);
+    this.broadcastSnapshot(state);
+    return updated;
+  }
+
+  pin(questionId: string): Question | null {
+    const { state, question } = this.lookup(questionId);
+    if (!state || !question) return null;
+    if (question.pinned) return question;
+    const updated = this.recompute(question, { pinned: true });
+    state.questions.set(updated.id, updated);
+    this.broadcastSnapshot(state);
+    return updated;
+  }
+
+  unpin(questionId: string): Question | null {
+    const { state, question } = this.lookup(questionId);
+    if (!state || !question) return null;
+    if (!question.pinned) return question;
+    const updated = this.recompute(question, { pinned: false });
+    state.questions.set(updated.id, updated);
+    this.broadcastSnapshot(state);
+    return updated;
+  }
+
+  hide(questionId: string): Question | null {
+    const { state, question } = this.lookup(questionId);
+    if (!state || !question) return null;
+    if (question.state === 'HIDDEN') return question;
+    const updated = this.recompute(question, {
+      state: 'HIDDEN',
+      pinned: false,
+      hiddenAt: new Date(this.clock.now()),
+    });
+    state.questions.set(updated.id, updated);
+    this.broadcastSnapshot(state);
+    return updated;
+  }
+
+  // -------------------------------------------------------------------------
+  // Reads
+  // -------------------------------------------------------------------------
+
+  get(questionId: string): Question | null {
+    return this.lookup(questionId).question ?? null;
+  }
+
+  list(broadcastId: string): QuestionListSnapshot {
+    const state = this.ensureState(broadcastId);
+    return this.buildSnapshot(state);
+  }
+
+  /** Returns the broadcaster panel order (pinned first, then OPEN by score). */
+  panel(broadcastId: string): Question[] {
+    const snapshot = this.list(broadcastId);
+    return [...snapshot.pinned, ...snapshot.open];
+  }
+
+  subscribe(broadcastId: string, listener: QASnapshotListener): () => void {
+    const state = this.ensureState(broadcastId);
+    state.listeners.add(listener);
+    return () => state.listeners.delete(listener);
+  }
+
+  closeBroadcast(broadcastId: string): void {
+    const state = this.broadcasts.get(broadcastId);
+    if (!state) return;
+    state.listeners.clear();
+    this.broadcasts.delete(broadcastId);
+    logger.info({ broadcastId }, 'LiveQAService broadcast closed');
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  private ensureState(broadcastId: string): BroadcastQAState {
+    let state = this.broadcasts.get(broadcastId);
+    if (state) return state;
+    state = {
+      broadcastId,
+      questions: new Map(),
+      upvoteRegistry: new Map(),
+      userTimestamps: new Map(),
+      recentBodies: new Map(),
+      listeners: new Set(),
     };
+    this.broadcasts.set(broadcastId, state);
+    return state;
+  }
 
-    if (!this.questions.has(broadcastId)) {
-      this.questions.set(broadcastId, []);
+  private lookup(questionId: string): { state: BroadcastQAState | null; question: Question | null } {
+    if (typeof questionId !== 'string' || questionId.length === 0) {
+      return { state: null, question: null };
     }
-    this.questions.get(broadcastId)!.push(question);
-    this.submissionCounts.set(countKey, currentCount + 1);
-
-    this.emit('question:submitted', question);
-    logger.info(
-      { questionId: question.id, broadcastId, authorId },
-      'LiveQAService: question submitted',
-    );
-    return question;
-  }
-
-  /**
-   * Upvote a question.  A user can only upvote each question once.
-   */
-  upvoteQuestion(questionId: string, userId: string): UpvoteResult {
-    const upvoteKey = `${userId}:${questionId}`;
-    if (this.upvoteRecord.has(upvoteKey)) {
-      return { success: false, reason: 'Already upvoted this question' };
+    for (const state of this.broadcasts.values()) {
+      const q = state.questions.get(questionId);
+      if (q) return { state, question: q };
     }
+    return { state: null, question: null };
+  }
 
-    const question = this._findQuestion(questionId);
-    if (!question) {
-      return { success: false, reason: 'Question not found' };
+  private passesUserThrottle(state: BroadcastQAState, userId: string, now: number): boolean {
+    let timestamps = state.userTimestamps.get(userId);
+    const cutoff = now - 60_000;
+    if (!timestamps) {
+      timestamps = [];
+      state.userTimestamps.set(userId, timestamps);
     }
-    if (question.status === 'dismissed') {
-      return { success: false, reason: 'Question has been dismissed' };
+    let drop = 0;
+    while (drop < timestamps.length && timestamps[drop] <= cutoff) drop++;
+    if (drop > 0) timestamps.splice(0, drop);
+    if (timestamps.length >= this.perUserPerMinute) return false;
+    timestamps.push(now);
+    return true;
+  }
+
+  private passesDuplicateGuard(
+    state: BroadcastQAState,
+    userId: string,
+    body: string,
+    now: number
+  ): boolean {
+    const key = `${userId}::${body.toLowerCase()}`;
+    // Evict expired entries (linear scan; map size is bounded by traffic).
+    const cutoff = now - this.duplicateWindowMs;
+    for (const [k, ts] of state.recentBodies) {
+      if (ts <= cutoff) state.recentBodies.delete(k);
     }
-
-    question.upvotes += 1;
-    this.upvoteRecord.add(upvoteKey);
-
-    this.emit('question:upvoted', { questionId, userId, newUpvotes: question.upvotes });
-    return { success: true, newUpvotes: question.upvotes };
+    if (state.recentBodies.has(key)) return false;
+    state.recentBodies.set(key, now);
+    return true;
   }
 
-  // ── Broadcaster API ────────────────────────────────────────────────────────
-
-  /**
-   * Mark a question as answered.
-   */
-  markAnswered(questionId: string): Question {
-    const question = this._getQuestion(questionId);
-    if (question.status === 'answered') {
-      throw new Error(`Question ${questionId} is already answered`);
-    }
-
-    question.status = 'answered';
-    question.answeredAt = Date.now();
-
-    this.emit('question:answered', question);
-    logger.info({ questionId }, 'LiveQAService: question answered');
-    return { ...question };
-  }
-
-  /**
-   * Dismiss (soft-delete) a question.  Dismissed questions are hidden from the
-   * viewer queue but remain in history for broadcaster review.
-   */
-  dismissQuestion(questionId: string): Question {
-    const question = this._getQuestion(questionId);
-    question.status = 'dismissed';
-
-    this.emit('question:dismissed', { questionId });
-    return { ...question };
-  }
-
-  /**
-   * Pin a question to the top of the queue.
-   */
-  pinQuestion(questionId: string): Question {
-    const question = this._getQuestion(questionId);
-    question.pinned = true;
-
-    this.emit('question:pinned', { questionId });
-    return { ...question };
-  }
-
-  /**
-   * Unpin a question.
-   */
-  unpinQuestion(questionId: string): Question {
-    const question = this._getQuestion(questionId);
-    question.pinned = false;
-
-    this.emit('question:unpinned', { questionId });
-    return { ...question };
-  }
-
-  // ── Query API ──────────────────────────────────────────────────────────────
-
-  /**
-   * Get questions for a broadcast, sorted by:
-   *   1. Pinned questions first (if pinnedFirst is true)
-   *   2. Upvotes descending
-   *   3. Creation time descending (newest first within same vote count)
-   */
-  getQuestions(
-    broadcastId: string,
-    options: QuestionListOptions = {},
-  ): Question[] {
-    const {
-      status = 'all',
-      pinnedFirst = true,
-      limit = 100,
-    } = options;
-
-    const list = this.questions.get(broadcastId) ?? [];
-
-    const filtered = list.filter((q) => {
-      if (status !== 'all' && q.status !== status) return false;
-      return true;
+  private recompute(question: Question, patch: Partial<Question>): Question {
+    const upvotes = patch.upvotes ?? question.upvotes;
+    const pinned = patch.pinned ?? question.pinned;
+    const createdAt = question.createdAt;
+    return Object.freeze({
+      id: question.id,
+      broadcastId: question.broadcastId,
+      authorId: question.authorId,
+      authorDisplayName: question.authorDisplayName,
+      body: question.body,
+      upvotes,
+      state: patch.state ?? question.state,
+      pinned,
+      createdAt,
+      answeredAt: patch.answeredAt !== undefined ? patch.answeredAt : question.answeredAt,
+      hiddenAt: patch.hiddenAt !== undefined ? patch.hiddenAt : question.hiddenAt,
+      score: computeScore({ upvotes, pinned, createdAt }),
     });
+  }
 
-    filtered.sort((a, b) => {
-      // Pinned questions bubble to the top when requested
-      if (pinnedFirst) {
-        if (a.pinned && !b.pinned) return -1;
-        if (!a.pinned && b.pinned) return 1;
-      }
-      // Then sort by upvotes descending
-      if (b.upvotes !== a.upvotes) return b.upvotes - a.upvotes;
-      // Then by recency descending
-      return b.createdAt - a.createdAt;
+  private buildSnapshot(state: BroadcastQAState): QuestionListSnapshot {
+    const all = Array.from(state.questions.values());
+    const pinned: Question[] = [];
+    const open: Question[] = [];
+    const answered: Question[] = [];
+    let totalUpvotes = 0;
+    for (const q of all) {
+      totalUpvotes += q.upvotes;
+      if (q.state === 'HIDDEN') continue;
+      if (q.pinned && q.state === 'OPEN') pinned.push(q);
+      else if (q.state === 'OPEN') open.push(q);
+      else if (q.state === 'ANSWERED') answered.push(q);
+    }
+    pinned.sort((a, b) => b.score - a.score);
+    open.sort((a, b) => b.score - a.score);
+    answered.sort((a, b) => (b.answeredAt?.getTime() ?? 0) - (a.answeredAt?.getTime() ?? 0));
+    return Object.freeze({
+      broadcastId: state.broadcastId,
+      pinned: Object.freeze(pinned),
+      open: Object.freeze(open),
+      answered: Object.freeze(answered),
+      totalQuestions: all.length,
+      totalUpvotes,
+      generatedAt: new Date(this.clock.now()),
     });
-
-    return filtered.slice(0, limit).map((q) => ({ ...q }));
   }
 
-  /**
-   * Get a single question by id.
-   */
-  getQuestion(questionId: string): Question | null {
-    const q = this._findQuestion(questionId);
-    return q ? { ...q } : null;
-  }
-
-  /**
-   * Return the top N unanswered, non-dismissed questions sorted by upvotes.
-   * Convenience wrapper for broadcaster dashboards.
-   */
-  getTopPendingQuestions(broadcastId: string, limit = 10): Question[] {
-    return this.getQuestions(broadcastId, { status: 'pending', pinnedFirst: true, limit });
-  }
-
-  /** Return the total number of questions submitted for a broadcast. */
-  getQuestionCount(broadcastId: string): number {
-    return this.questions.get(broadcastId)?.length ?? 0;
-  }
-
-  /** Clear all data for a broadcast (e.g., when the broadcast ends). */
-  clearBroadcast(broadcastId: string): void {
-    const list = this.questions.get(broadcastId) ?? [];
-    for (const q of list) {
-      // Remove associated upvote records
-      for (const key of this.upvoteRecord) {
-        if (key.endsWith(`:${q.id}`)) {
-          this.upvoteRecord.delete(key);
-        }
+  private broadcastSnapshot(state: BroadcastQAState): void {
+    if (state.listeners.size === 0) return;
+    const snapshot = this.buildSnapshot(state);
+    for (const listener of state.listeners) {
+      try {
+        listener(snapshot);
+      } catch (err) {
+        logger.warn({ err, broadcastId: state.broadcastId }, 'LiveQAService listener threw');
       }
     }
-    this.questions.delete(broadcastId);
-    // Remove submission counts for this broadcast
-    for (const [key] of this.submissionCounts) {
-      if (key.endsWith(`:${broadcastId}`)) {
-        this.submissionCounts.delete(key);
-      }
-    }
-    this.emit('broadcast:cleared', { broadcastId });
-  }
-
-  // ── Private ────────────────────────────────────────────────────────────────
-
-  private _findQuestion(questionId: string): Question | null {
-    for (const list of this.questions.values()) {
-      const q = list.find((item) => item.id === questionId);
-      if (q) return q;
-    }
-    return null;
-  }
-
-  private _getQuestion(questionId: string): Question {
-    const q = this._findQuestion(questionId);
-    if (!q) throw new Error(`Question not found: ${questionId}`);
-    return q;
   }
 }
 
-// ─── Singleton helper ─────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Singleton
+// ---------------------------------------------------------------------------
 
-let _qaServiceInstance: LiveQAService | null = null;
+let singleton: LiveQAService | null = null;
 
-export function getLiveQAService(config?: LiveQAServiceConfig): LiveQAService {
-  if (!_qaServiceInstance) {
-    _qaServiceInstance = new LiveQAService(config);
-  }
-  return _qaServiceInstance;
+export function getLiveQAService(options?: LiveQAServiceOptions): LiveQAService {
+  if (!singleton) singleton = new LiveQAService(options);
+  return singleton;
 }
 
-export function resetLiveQAService(): void {
-  _qaServiceInstance = null;
+export function __resetLiveQAServiceSingleton(): void {
+  singleton = null;
 }
