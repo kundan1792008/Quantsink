@@ -1,198 +1,315 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { NextFunction, Request, Response, Router } from 'express';
 import { z } from 'zod';
+
+import {
+  DEFAULT_CHALLENGE_TEMPLATES,
+  InfluenceScoreService,
+} from '../services/InfluenceScoreService';
+import {
+  InMemoryInfluenceStore,
+  INFLUENCE_COMPONENT_WEIGHTS,
+  INFLUENCE_TIER_THRESHOLDS,
+  InfluenceChallengeKind,
+  InfluenceScoreSnapshot,
+  InfluenceStore,
+  tierDescriptor,
+} from '../services/InfluenceScoreDomain';
+import QualityRatingAI from '../services/QualityRatingAI';
 import { requireAuth } from '../middleware/auth';
-import { InfluenceScoreService } from '../services/InfluenceScoreService';
-import { ScoreDecayWorker } from '../workers/ScoreDecayWorker';
-import prisma from '../lib/prisma';
 
-const router = Router();
-const influenceService = new InfluenceScoreService();
-const decayWorker = new ScoreDecayWorker();
+/**
+ * HTTP surface for the Influence Score system.
+ *
+ *   GET  /api/influence/score        — current user's breakdown
+ *   GET  /api/influence/leaderboard  — paginated leaderboard
+ *   GET  /api/influence/history      — user's daily snapshots
+ *   POST /api/influence/challenge    — start/claim a boost challenge
+ *   GET  /api/influence/tiers        — static tier definitions (no auth)
+ *   GET  /api/influence/nearby       — users within ±50 of your score
+ *
+ * All routes are isomorphically-safe: if no `store` is provided by
+ * `createInfluenceRouter`, an in-memory default is used, so the
+ * application still boots in environments without a database.
+ */
 
-// ---------------------------------------------------------------------------
-// Zod schemas
-// ---------------------------------------------------------------------------
-
-const PaginationSchema = z.object({
-  page:     z.coerce.number().int().min(1).optional().default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).optional().default(50),
-  nearby:   z.coerce.boolean().optional().default(false),
-});
-
-const HistorySchema = z.object({
-  days: z.coerce.number().int().min(1).max(90).optional().default(30),
-});
+const CHALLENGE_KINDS: readonly InfluenceChallengeKind[] = Object.keys(
+  DEFAULT_CHALLENGE_TEMPLATES,
+) as InfluenceChallengeKind[];
 
 const ChallengeSchema = z.object({
-  challengeType: z
-    .enum(['DAILY_POST', 'ENGAGEMENT_SPIKE', 'CROSS_APP_VISIT', 'BIOMETRIC_REFRESH', 'COMMUNITY_VOUCH'])
-    .optional(),
+  kind: z.enum(CHALLENGE_KINDS as unknown as [string, ...string[]]),
 });
 
-const CompleteBoostSchema = z.object({
-  challengeId: z.string().uuid(),
+const LeaderboardQuerySchema = z.object({
+  page: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? 0 : Number.parseInt(v, 10)))
+    .refine((v) => Number.isFinite(v) && v >= 0, {
+      message: 'page must be a non-negative integer',
+    }),
+  pageSize: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? 20 : Number.parseInt(v, 10)))
+    .refine((v) => Number.isFinite(v) && v >= 1 && v <= 100, {
+      message: 'pageSize must be between 1 and 100',
+    }),
+  tier: z.enum(['BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'DIAMOND']).optional(),
 });
 
-// ---------------------------------------------------------------------------
-// Helper — resolve the DB user from the JWT sub
-// ---------------------------------------------------------------------------
-async function resolveUser(
-  req: Request,
-  res: Response,
-): Promise<{ id: string } | null> {
-  const userId = req.user!.sub;
-  const user = await prisma.user.findUnique({
-    where:  { quantmailId: userId },
-    select: { id: true },
-  });
-  if (!user) {
-    res.status(404).json({ error: 'User profile not found. Please post something first.' });
-    return null;
-  }
-  return user;
+const HistoryQuerySchema = z.object({
+  days: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? 30 : Number.parseInt(v, 10)))
+    .refine((v) => Number.isFinite(v) && v >= 1 && v <= 90, {
+      message: 'days must be between 1 and 90',
+    }),
+});
+
+const NearbyQuerySchema = z.object({
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined ? 20 : Number.parseInt(v, 10)))
+    .refine((v) => Number.isFinite(v) && v >= 1 && v <= 100, {
+      message: 'limit must be between 1 and 100',
+    }),
+});
+
+export interface CreateInfluenceRouterOptions {
+  readonly service?: InfluenceScoreService;
+  readonly store?: InfluenceStore;
+  readonly quality?: QualityRatingAI;
 }
 
-// ---------------------------------------------------------------------------
-// GET /api/v1/influence/score — current user's score breakdown
-// ---------------------------------------------------------------------------
-router.get('/score', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const user = await resolveUser(req, res);
-    if (!user) return;
+/**
+ * Factory — allows the main `app.ts` to inject a custom service
+ * (wired to Prisma in production) while keeping defaults that make
+ * the route testable in isolation.
+ */
+export function createInfluenceRouter(
+  options: CreateInfluenceRouterOptions = {},
+): Router {
+  const store = options.store ?? new InMemoryInfluenceStore();
+  const quality = options.quality ?? new QualityRatingAI({ store });
+  const service =
+    options.service ?? new InfluenceScoreService({ store, quality });
 
-    const result = await influenceService.getScore(user.id);
-    const effectiveScore = await decayWorker.effectiveScore(user.id);
+  const router = Router();
 
+  // -------------------------------------------------------------------------
+  // GET /api/influence/tiers — public
+  // -------------------------------------------------------------------------
+  router.get('/tiers', (_req: Request, res: Response) => {
     res.json({
-      userId:           result.userId,
-      totalScore:       result.totalScore,
-      effectiveScore,   // includes active challenge boosts
-      tier:             result.tier,
-      rankPosition:     result.rankPosition,
-      lastCalculatedAt: result.lastCalculatedAt,
-      components: {
-        broadcastQuality:  { score: result.components.broadcastQuality,  weight: '25%' },
-        engagementRate:    { score: result.components.engagementRate,    weight: '20%' },
-        consistency:       { score: result.components.consistency,       weight: '15%' },
-        biometricLevel:    { score: result.components.biometricLevel,    weight: '15%' },
-        crossAppActivity:  { score: result.components.crossAppActivity,  weight: '15%' },
-        communityStanding: { score: result.components.communityStanding, weight: '10%' },
-      },
+      weights: INFLUENCE_COMPONENT_WEIGHTS,
+      tiers: INFLUENCE_TIER_THRESHOLDS.map((t) => ({
+        tier: t.tier,
+        label: t.label,
+        min: t.min,
+        max: t.max,
+        accentColor: t.accentColor,
+      })),
+      challengeTemplates: CHALLENGE_KINDS.map((k) => {
+        const template = DEFAULT_CHALLENGE_TEMPLATES[k];
+        return {
+          kind: template.kind,
+          target: template.target,
+          rewardPoints: template.rewardPoints,
+          durationHours: template.durationHours,
+          description: template.description,
+        };
+      }),
     });
-  } catch (err) {
-    next(err);
-  }
-});
+  });
 
-// ---------------------------------------------------------------------------
-// GET /api/v1/influence/leaderboard — paginated leaderboard
-// ---------------------------------------------------------------------------
-router.get('/leaderboard', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = PaginationSchema.safeParse(req.query);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
-      return;
-    }
+  // -------------------------------------------------------------------------
+  // GET /api/influence/score — current user's breakdown
+  // -------------------------------------------------------------------------
+  router.get(
+    '/score',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = req.user!.sub;
+        const breakdown = await service.getBreakdown(userId);
+        const rank = await service.rankFor(userId);
+        res.json({
+          score: {
+            userId: breakdown.userId,
+            total: breakdown.total,
+            tier: breakdown.tier,
+            tierLabel: breakdown.tierLabel,
+            tierMin: breakdown.tierMin,
+            tierMax: breakdown.tierMax,
+            tierAccentColor: breakdown.tierAccentColor,
+            components: breakdown.components,
+            weights: breakdown.weights,
+            activeBoostPoints: breakdown.activeBoostPoints,
+            activeBoosts: breakdown.activeBoosts,
+            lastRecalculatedAt: breakdown.lastRecalculatedAt,
+          },
+          rank,
+        });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-    const { page, pageSize, nearby } = parsed.data;
-    const user = await resolveUser(req, res);
-    if (!user) return;
+  // -------------------------------------------------------------------------
+  // POST /api/influence/score/recalc — force recompute (current user)
+  // -------------------------------------------------------------------------
+  router.post(
+    '/score/recalc',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = req.user!.sub;
+        const score = await service.recalculate(userId);
+        res.json({ score });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-    if (nearby) {
-      const entries = await influenceService.getNearbyLeaderboard(user.id);
-      res.json({ entries, type: 'nearby' });
-      return;
-    }
+  // -------------------------------------------------------------------------
+  // GET /api/influence/leaderboard
+  // -------------------------------------------------------------------------
+  router.get(
+    '/leaderboard',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const parsed = LeaderboardQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+          res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
+          return;
+        }
+        const { page, pageSize, tier } = parsed.data;
+        const pageResult = await service.getLeaderboard(page, pageSize);
+        const filtered = tier
+          ? pageResult.rows.filter((row) => row.tier === tier)
+          : pageResult.rows;
+        res.json({
+          leaderboard: filtered,
+          total: pageResult.total,
+          nextCursor: pageResult.nextCursor,
+          page,
+          pageSize,
+          tier: tier ?? null,
+        });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-    const board = await influenceService.getLeaderboard(page, pageSize);
-    res.json(board);
-  } catch (err) {
-    next(err);
-  }
-});
+  // -------------------------------------------------------------------------
+  // GET /api/influence/nearby
+  // -------------------------------------------------------------------------
+  router.get(
+    '/nearby',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const parsed = NearbyQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+          res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
+          return;
+        }
+        const userId = req.user!.sub;
+        const rows = await service.getNearby(userId, parsed.data.limit);
+        res.json({ nearby: rows });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-// ---------------------------------------------------------------------------
-// GET /api/v1/influence/history — score history with daily snapshots
-// ---------------------------------------------------------------------------
-router.get('/history', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = HistorySchema.safeParse(req.query);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
-      return;
-    }
+  // -------------------------------------------------------------------------
+  // GET /api/influence/history
+  // -------------------------------------------------------------------------
+  router.get(
+    '/history',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const parsed = HistoryQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+          res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
+          return;
+        }
+        const userId = req.user!.sub;
+        const history = await service.getHistory(userId, parsed.data.days);
+        res.json({
+          history: history.map(serialiseSnapshot),
+          days: parsed.data.days,
+        });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-    const user = await resolveUser(req, res);
-    if (!user) return;
+  // -------------------------------------------------------------------------
+  // POST /api/influence/challenge
+  // -------------------------------------------------------------------------
+  router.post(
+    '/challenge',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const parsed = ChallengeSchema.safeParse(req.body);
+        if (!parsed.success) {
+          res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
+          return;
+        }
+        const userId = req.user!.sub;
+        const kind = parsed.data.kind as InfluenceChallengeKind;
+        const challenge = await service.startChallenge(userId, kind);
+        res.status(201).json({ challenge });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-    const history = await influenceService.getHistory(user.id, parsed.data.days);
-    res.json({ history, days: parsed.data.days });
-  } catch (err) {
-    next(err);
-  }
-});
+  // -------------------------------------------------------------------------
+  // GET /api/influence/challenges — list current user's challenges
+  // -------------------------------------------------------------------------
+  router.get(
+    '/challenges',
+    requireAuth,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = req.user!.sub;
+        const challenges = await service.listChallenges(userId);
+        res.json({ challenges });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
-// ---------------------------------------------------------------------------
-// POST /api/v1/influence/challenge — start a challenge for boost points
-// ---------------------------------------------------------------------------
-router.post('/challenge', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = ChallengeSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
-      return;
-    }
+  return router;
+}
 
-    const user = await resolveUser(req, res);
-    if (!user) return;
+function serialiseSnapshot(snap: InfluenceScoreSnapshot): Record<string, unknown> {
+  const descriptor = tierDescriptor(snap.tier);
+  return {
+    snapshotAt: snap.snapshotAt.toISOString(),
+    total: snap.total,
+    components: snap.components,
+    tier: snap.tier,
+    tierLabel: descriptor.label,
+    tierAccentColor: descriptor.accentColor,
+  };
+}
 
-    const result = await influenceService.startChallenge(user.id, parsed.data.challengeType);
-    res.status(201).json(result);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// POST /api/v1/influence/challenge/complete — mark a challenge complete
-// ---------------------------------------------------------------------------
-router.post('/challenge/complete', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = CompleteBoostSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
-      return;
-    }
-
-    const user = await resolveUser(req, res);
-    if (!user) return;
-
-    const newScore = await decayWorker.applyBoostEvent(user.id, parsed.data.challengeId);
-    if (newScore === null) {
-      res.status(404).json({ error: 'Challenge not found, expired, or already completed.' });
-      return;
-    }
-
-    res.json({ effectiveScore: newScore, message: 'Challenge completed! +50 boost applied for 24 hours.' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// POST /api/v1/influence/recalculate — trigger manual recalculation
-// ---------------------------------------------------------------------------
-router.post('/recalculate', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const user = await resolveUser(req, res);
-    if (!user) return;
-
-    const result = await influenceService.recalculate(user.id, true);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
-
-export default router;
+// Default export — used by `app.ts` with the shared store/service.
+const defaultRouter = createInfluenceRouter();
+export default defaultRouter;

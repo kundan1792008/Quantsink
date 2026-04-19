@@ -1,337 +1,196 @@
+import {
+  BoostEvent,
+  DEFAULT_HISTORY_DAYS,
+  INFLUENCE_COMPONENT_WEIGHTS,
+  INFLUENCE_TIER_THRESHOLDS,
+  InMemoryInfluenceStore,
+  InfluenceChallenge,
+  InfluenceChallengeKind,
+  InfluenceScore,
+  InfluenceScoreSnapshot,
+  InfluenceSignalInputs,
+  InfluenceStore,
+  InfluenceTier,
+  MAX_HISTORY_DAYS,
+  UserReportRecord,
+  clamp,
+  computeComponents,
+  computeScoreFromInputs,
+  influenceLog,
+  tierDescriptor,
+  tierForTotal,
+  weightedTotal,
+} from './InfluenceScoreDomain';
+
+import { unrefTimer } from '../lib/timers';
+import QualityRatingAI from './QualityRatingAI';
+
 /**
- * InfluenceScoreService — Social Credit & Influence Score Engine
+ * InfluenceScoreService
+ * ---------------------
+ * High-level orchestrator for the Influence Score system (issue #16).
  *
- * Every user gets a public Influence Score (0-1000) calculated from behaviour
- * across all 9 Quant apps.  The score is a weighted composite of six
- * components:
+ *   • Calculates the public 0–1000 score from the six weighted
+ *     sub-components: Broadcast Quality, Engagement Rate, Consistency,
+ *     Biometric Verification Level, Cross-App Activity, Community
+ *     Standing.
+ *   • Appends a historical snapshot on every recalculation so the
+ *     leaderboard UI can render the 30-day line chart required by the
+ *     issue.
+ *   • Prunes historical snapshots older than 90 days on every write.
+ *   • Starts, progresses and completes "Boost" challenges.
+ *   • Exposes leaderboard + "nearby" queries that the HTTP routes and
+ *     the React leaderboard component consume.
  *
- *   Component              Weight  Source
- *   ─────────────────────────────────────────────────────────────────────
- *   Broadcast Quality      25 %   AI-rated (QualityRatingAI, 0-100)
- *   Engagement Rate        20 %   views/impressions ratio (0-100)
- *   Consistency            15 %   posting frequency score (0-100)
- *   Biometric Level        15 %   verification strength (0-100)
- *   Cross-App Activity     15 %   how many Quant apps used (0-100)
- *   Community Standing     10 %   reports against user reduce this (0-100)
- *
- * Final score = Σ(component × weight) × 10   → range 0-1000.
- * Scores are stored in the `InfluenceScore` table and a daily
- * snapshot is appended to `ScoreHistory` (retained for 90 days).
- *
- * A `recalculate` call is idempotent within a 6-hour window; callers
- * can therefore invoke it on every relevant user action without
- * over-working the database.
+ * The service is deliberately I/O-light: all persistence goes through
+ * the injected `InfluenceStore`, all time-sensitive calls go through
+ * the injected `now()` clock, and it pulls the latest broadcast
+ * quality numbers from an injected `QualityRatingAI`. That makes the
+ * service deterministic under test.
  */
 
-import prisma from '../lib/prisma';
-import logger from '../lib/logger';
-import { QualityRatingAI } from './QualityRatingAI';
-
 // ---------------------------------------------------------------------------
-// Public types
+// Signal provider + options
 // ---------------------------------------------------------------------------
 
-export interface ScoreComponents {
-  broadcastQuality: number;   // 0-100
-  engagementRate: number;     // 0-100
-  consistency: number;        // 0-100
-  biometricLevel: number;     // 0-100
-  crossAppActivity: number;   // 0-100
-  communityStanding: number;  // 0-100
+/**
+ * Live signals the service cannot reasonably persist itself: the
+ * biometric verification level returned by Quantmail, the raw view
+ * counts captured by the broadcast WebSocket, the user's posting
+ * streak, etc. Implementations read these from the rest of the
+ * Quantsink runtime.
+ */
+export interface InfluenceSignalProvider {
+  /** 0–100 biometric verification level currently associated with user. */
+  biometricLevel(userId: string): Promise<number>;
+  /** Impressions the user's broadcasts have received in the last 30d. */
+  impressionsLast30d(userId: string): Promise<number>;
+  /** Views the user's broadcasts have received in the last 30d. */
+  viewsLast30d(userId: string): Promise<number>;
+  /** Number of consecutive days with at least one broadcast. */
+  currentPostStreakDays(userId: string): Promise<number>;
+  /** Number of broadcasts the user has authored in the last 30d. */
+  postsLast30d(userId: string): Promise<number>;
+  /** Quant ecosystem apps the user has touched in the last 30d. */
+  uniqueQuantAppsLast30d(userId: string): Promise<number>;
 }
 
-export interface InfluenceScoreResult {
-  userId: string;
-  totalScore: number;         // 0-1000
-  components: ScoreComponents;
-  tier: InfluenceTier;
-  rankPosition: number | null; // 1-based global rank; null if not yet ranked
-  lastCalculatedAt: Date;
+export interface InfluenceScoreServiceOptions {
+  readonly store?: InfluenceStore;
+  readonly quality?: QualityRatingAI;
+  readonly signals?: InfluenceSignalProvider;
+  readonly now?: () => Date;
+  /** Recalculation cadence in milliseconds. Default 6h. */
+  readonly recalcIntervalMs?: number;
+  /** Max rolling window for storing historical snapshots. Default 90 days. */
+  readonly historyWindowDays?: number;
+  /** Max rows returned from listUsersWithScoreOlderThan per recalculation tick. */
+  readonly recalcBatchSize?: number;
+  /** Maximum leaderboard page size. */
+  readonly maxLeaderboardPage?: number;
+  /** Score window used by the "nearby" tab. */
+  readonly nearbySpread?: number;
+  /** How many of the user's most recent ratings contribute to the average. */
+  readonly qualitySampleSize?: number;
 }
 
-export type InfluenceTier =
-  | 'BRONZE'
-  | 'SILVER'
-  | 'GOLD'
-  | 'PLATINUM'
-  | 'DIAMOND';
+/**
+ * Default signal provider used when callers instantiate the service
+ * without wiring custom data sources. Returns safe zeros so the score
+ * never blows up in dev.
+ */
+export class NullSignalProvider implements InfluenceSignalProvider {
+  async biometricLevel(): Promise<number> { return 0; }
+  async impressionsLast30d(): Promise<number> { return 0; }
+  async viewsLast30d(): Promise<number> { return 0; }
+  async currentPostStreakDays(): Promise<number> { return 0; }
+  async postsLast30d(): Promise<number> { return 0; }
+  async uniqueQuantAppsLast30d(): Promise<number> { return 0; }
+}
 
-export interface LeaderboardEntry {
-  rank: number;
-  userId: string;
-  displayName: string;
-  avatarUrl: string | null;
-  totalScore: number;
-  tier: InfluenceTier;
-  /** Positive = moved up, negative = moved down, 0 = no change vs yesterday. */
-  rankChange: number;
+// ---------------------------------------------------------------------------
+// Challenge templates
+// ---------------------------------------------------------------------------
+
+export interface ChallengeTemplate {
+  readonly kind: InfluenceChallengeKind;
+  readonly target: number;
+  readonly rewardPoints: number;
+  readonly durationHours: number;
+  readonly description: string;
+}
+
+export const DEFAULT_CHALLENGE_TEMPLATES: Readonly<Record<InfluenceChallengeKind, ChallengeTemplate>> =
+  Object.freeze({
+    POST_STREAK: {
+      kind: 'POST_STREAK',
+      target: 7,
+      rewardPoints: 50,
+      durationHours: 24 * 7,
+      description: 'Broadcast once a day for 7 days in a row.',
+    },
+    BIOMETRIC_WEEK: {
+      kind: 'BIOMETRIC_WEEK',
+      target: 5,
+      rewardPoints: 50,
+      durationHours: 24 * 7,
+      description: 'Complete a biometric verification five days this week.',
+    },
+    CROSS_APP_EXPLORER: {
+      kind: 'CROSS_APP_EXPLORER',
+      target: 5,
+      rewardPoints: 50,
+      durationHours: 24 * 14,
+      description: 'Use five different Quant apps within two weeks.',
+    },
+    QUALITY_AUTHOR: {
+      kind: 'QUALITY_AUTHOR',
+      target: 3,
+      rewardPoints: 50,
+      durationHours: 24 * 7,
+      description: 'Publish three broadcasts with a quality score ≥ 80.',
+    },
+    COMMUNITY_UPLIFT: {
+      kind: 'COMMUNITY_UPLIFT',
+      target: 10,
+      rewardPoints: 50,
+      durationHours: 24 * 14,
+      description: 'Help 10 neighbours across the network in two weeks.',
+    },
+  });
+
+// ---------------------------------------------------------------------------
+// Public breakdown shape (returned by the API)
+// ---------------------------------------------------------------------------
+
+export interface InfluenceBreakdown {
+  readonly userId: string;
+  readonly total: number;
+  readonly tier: InfluenceTier;
+  readonly tierMin: number;
+  readonly tierMax: number;
+  readonly tierAccentColor: string;
+  readonly tierLabel: string;
+  readonly components: InfluenceScoreSnapshot['components'];
+  readonly weights: typeof INFLUENCE_COMPONENT_WEIGHTS;
+  readonly activeBoostPoints: number;
+  readonly activeBoosts: readonly BoostEvent[];
+  readonly lastRecalculatedAt: Date;
+}
+
+export interface LeaderboardRow {
+  readonly userId: string;
+  readonly rank: number;
+  readonly total: number;
+  readonly tier: InfluenceTier;
+  readonly tierLabel: string;
+  readonly tierAccentColor: string;
 }
 
 export interface LeaderboardPage {
-  entries: LeaderboardEntry[];
-  totalUsers: number;
-  page: number;
-  pageSize: number;
-  hasNextPage: boolean;
-}
-
-export interface ScoreHistoryPoint {
-  date: string;               // ISO date string (YYYY-MM-DD)
-  score: number;
-  components: ScoreComponents;
-}
-
-export interface ChallengeResult {
-  challengeId: string;
-  challengeType: string;
-  boostPoints: number;
-  expiresAt: Date;
-  message: string;
-}
-
-// ---------------------------------------------------------------------------
-// Internal constants
-// ---------------------------------------------------------------------------
-
-const COMPONENT_WEIGHTS: Record<keyof ScoreComponents, number> = {
-  broadcastQuality:  0.25,
-  engagementRate:    0.20,
-  consistency:       0.15,
-  biometricLevel:    0.15,
-  crossAppActivity:  0.15,
-  communityStanding: 0.10,
-};
-
-/** Recalculation is skipped if the last run was within this many ms. */
-const RECALC_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
-
-/** Snapshot history is retained for this many days. */
-const HISTORY_RETENTION_DAYS = 90;
-
-/** Challenge boost duration in ms (24 hours). */
-const CHALLENGE_BOOST_MS = 24 * 60 * 60 * 1000;
-
-/** Challenge types available for new challenges. */
-const AVAILABLE_CHALLENGES = [
-  'DAILY_POST',
-  'ENGAGEMENT_SPIKE',
-  'CROSS_APP_VISIT',
-  'BIOMETRIC_REFRESH',
-  'COMMUNITY_VOUCH',
-] as const;
-
-const qai = new QualityRatingAI();
-
-// ---------------------------------------------------------------------------
-// Helper functions
-// ---------------------------------------------------------------------------
-
-/** Map a 0-1000 total score to a named tier. */
-export function tierForScore(score: number): InfluenceTier {
-  if (score >= 801) return 'DIAMOND';
-  if (score >= 601) return 'PLATINUM';
-  if (score >= 401) return 'GOLD';
-  if (score >= 201) return 'SILVER';
-  return 'BRONZE';
-}
-
-/** UTC midnight for a given date — used to bucket daily snapshots. */
-function utcMidnight(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-
-function isoDateStr(d: Date): string {
-  return d.toISOString().slice(0, 10);
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-// ---------------------------------------------------------------------------
-// Component calculators
-// ---------------------------------------------------------------------------
-
-/**
- * Broadcast Quality (0-100)
- * Average AI quality score across the user's last 20 broadcasts.
- */
-async function calcBroadcastQuality(userId: string): Promise<number> {
-  const broadcasts = await prisma.broadcast.findMany({
-    where:   { authorId: userId, deletedAt: null },
-    orderBy: { createdAt: 'desc' },
-    take:    20,
-    select:  { content: true, biometricVerified: true },
-  });
-
-  if (broadcasts.length === 0) return 0;
-
-  const scores = broadcasts.map((b) =>
-    qai.rate(b.content, { biometricVerified: b.biometricVerified }).score,
-  );
-  const avg = scores.reduce((s, v) => s + v, 0) / scores.length;
-  return clamp(Math.round(avg), 0, 100);
-}
-
-/**
- * Engagement Rate (0-100)
- * Uses DeepPost view/like counts as a proxy for impressions.
- * 0 views = 0; reaching a combined engagement rate of 20% = 100.
- */
-async function calcEngagementRate(userId: string): Promise<number> {
-  const posts = await prisma.deepPost.findMany({
-    where:  { authorId: userId, isDeleted: false, isPublished: true },
-    select: { views: true, likes: true },
-    take:   20,
-    orderBy: { publishedAt: 'desc' },
-  });
-
-  if (posts.length === 0) {
-    // Fall back to short posts
-    const shortPosts = await prisma.shortPost.findMany({
-      where:  { authorId: userId, isDeleted: false },
-      select: { likes: true, reposts: true },
-      take:   20,
-      orderBy: { createdAt: 'desc' },
-    });
-    if (shortPosts.length === 0) return 0;
-    const totalEngagement = shortPosts.reduce((s, p) => s + p.likes + p.reposts, 0);
-    // Assume 50 impressions per short post
-    const totalImpressions = shortPosts.length * 50;
-    const rate = totalEngagement / totalImpressions;
-    return clamp(Math.round(rate * 500), 0, 100); // 20% rate = 100 pts
-  }
-
-  const totalViews = posts.reduce((s, p) => s + p.views, 0);
-  const totalLikes = posts.reduce((s, p) => s + p.likes, 0);
-  if (totalViews === 0) return 0;
-  const rate = totalLikes / totalViews;
-  return clamp(Math.round(rate * 500), 0, 100);
-}
-
-/**
- * Consistency (0-100)
- * Based on posting frequency over the last 30 days.
- * Posting every day = 100; once a week = ~50; less = scaled down.
- */
-async function calcConsistency(userId: string): Promise<number> {
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-
-  const [broadcastCount, shortPostCount, deepPostCount] = await Promise.all([
-    prisma.broadcast.count({
-      where: { authorId: userId, deletedAt: null, createdAt: { gte: thirtyDaysAgo } },
-    }),
-    prisma.shortPost.count({
-      where: { authorId: userId, isDeleted: false, createdAt: { gte: thirtyDaysAgo } },
-    }),
-    prisma.deepPost.count({
-      where: { authorId: userId, isDeleted: false, createdAt: { gte: thirtyDaysAgo } },
-    }),
-  ]);
-
-  const total = broadcastCount + shortPostCount + deepPostCount;
-  // 30 posts in 30 days = 100 (once a day); scale linearly.
-  return clamp(Math.round((total / 30) * 100), 0, 100);
-}
-
-/**
- * Biometric Level (0-100)
- * If isVerified = true → 100; otherwise 0.
- * Can be extended to a multi-tier scheme (basic / advanced / retina, etc.).
- */
-async function calcBiometricLevel(userId: string): Promise<number> {
-  const user = await prisma.user.findUnique({
-    where:  { id: userId },
-    select: { isVerified: true },
-  });
-  if (!user) return 0;
-  return user.isVerified ? 100 : 30; // 30 baseline for unverified (registered users)
-}
-
-/**
- * Cross-App Activity (0-100)
- * Proxy based on content diversity: broadcasts + short posts + deep posts +
- * connections + DMs, each representing a distinct interaction surface.
- * 5 or more distinct active surfaces = 100.
- */
-async function calcCrossAppActivity(userId: string): Promise<number> {
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
-  const [hasBroadcast, hasShortPost, hasDeepPost, hasConnection, hasDM] = await Promise.all([
-    prisma.broadcast.count({
-      where: { authorId: userId, deletedAt: null, createdAt: { gte: sevenDaysAgo } },
-    }),
-    prisma.shortPost.count({
-      where: { authorId: userId, isDeleted: false, createdAt: { gte: sevenDaysAgo } },
-    }),
-    prisma.deepPost.count({
-      where: { authorId: userId, isDeleted: false, createdAt: { gte: sevenDaysAgo } },
-    }),
-    prisma.connection.count({
-      where: { fromUserId: userId, createdAt: { gte: sevenDaysAgo } },
-    }),
-    prisma.directMessage.count({
-      where: { senderId: userId, createdAt: { gte: sevenDaysAgo } },
-    }),
-  ]);
-
-  const activeSurfaces = [hasBroadcast, hasShortPost, hasDeepPost, hasConnection, hasDM].filter(
-    (n) => n > 0,
-  ).length;
-
-  return clamp(activeSurfaces * 20, 0, 100);
-}
-
-/**
- * Community Standing (0-100)
- * Starts at 100 and decays based on reports/blocks against the user.
- * Each incoming block/report = -10 pts (floored at 0).
- */
-async function calcCommunityStanding(userId: string): Promise<number> {
-  const reportCount = await prisma.connection.count({
-    where: { toUserId: userId, status: 'BLOCKED' },
-  });
-  return clamp(100 - reportCount * 10, 0, 100);
-}
-
-// ---------------------------------------------------------------------------
-// Core composite scorer
-// ---------------------------------------------------------------------------
-
-async function computeComponents(userId: string): Promise<ScoreComponents> {
-  const [
-    broadcastQuality,
-    engagementRate,
-    consistency,
-    biometricLevel,
-    crossAppActivity,
-    communityStanding,
-  ] = await Promise.all([
-    calcBroadcastQuality(userId),
-    calcEngagementRate(userId),
-    calcConsistency(userId),
-    calcBiometricLevel(userId),
-    calcCrossAppActivity(userId),
-    calcCommunityStanding(userId),
-  ]);
-
-  return {
-    broadcastQuality,
-    engagementRate,
-    consistency,
-    biometricLevel,
-    crossAppActivity,
-    communityStanding,
-  };
-}
-
-function compositeScore(components: ScoreComponents): number {
-  const raw = (Object.keys(COMPONENT_WEIGHTS) as (keyof ScoreComponents)[]).reduce(
-    (sum, key) => sum + components[key] * COMPONENT_WEIGHTS[key],
-    0,
-  );
-  // raw is 0-100; multiply by 10 to get 0-1000
-  return clamp(Math.round(raw * 10), 0, 1000);
+  readonly rows: readonly LeaderboardRow[];
+  readonly total: number;
+  readonly nextCursor: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,428 +198,524 @@ function compositeScore(components: ScoreComponents): number {
 // ---------------------------------------------------------------------------
 
 export class InfluenceScoreService {
+  private readonly store: InfluenceStore;
+  private readonly quality: QualityRatingAI;
+  private readonly signals: InfluenceSignalProvider;
   private readonly now: () => Date;
+  private readonly recalcIntervalMs: number;
+  private readonly historyWindowDays: number;
+  private readonly recalcBatchSize: number;
+  private readonly maxLeaderboardPage: number;
+  private readonly nearbySpread: number;
+  private readonly qualitySampleSize: number;
+  private recalcTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(options: { now?: () => Date } = {}) {
+  constructor(options: InfluenceScoreServiceOptions = {}) {
+    this.store = options.store ?? new InMemoryInfluenceStore();
+    this.quality = options.quality ?? new QualityRatingAI({ store: this.store });
+    this.signals = options.signals ?? new NullSignalProvider();
     this.now = options.now ?? (() => new Date());
+    this.recalcIntervalMs = options.recalcIntervalMs ?? 6 * 60 * 60 * 1000;
+    this.historyWindowDays = clamp(
+      options.historyWindowDays ?? MAX_HISTORY_DAYS,
+      1,
+      MAX_HISTORY_DAYS,
+    );
+    this.recalcBatchSize = options.recalcBatchSize ?? 200;
+    this.maxLeaderboardPage = options.maxLeaderboardPage ?? 100;
+    this.nearbySpread = options.nearbySpread ?? 50;
+    this.qualitySampleSize = options.qualitySampleSize ?? 20;
   }
 
   // -------------------------------------------------------------------------
-  // Public API
+  // Score computation
   // -------------------------------------------------------------------------
 
   /**
-   * Recalculate the influence score for a single user.
-   *
-   * Skips recalculation if the last run was within the 6-hour cooldown
-   * (unless `force = true`).  After calculating, writes the result to
-   * `InfluenceScore` and appends a `ScoreHistory` row for today.
+   * Gather live signals + persisted signals, run them through the
+   * pure math in `InfluenceScoreDomain`, persist the result + a
+   * historical snapshot, and return the fresh score.
    */
-  async recalculate(userId: string, force = false): Promise<InfluenceScoreResult> {
-    const existing = await prisma.influenceScore.findUnique({ where: { userId } });
+  async recalculate(userId: string): Promise<InfluenceScore> {
+    this.assertUserId(userId);
+    const now = this.now();
 
-    if (!force && existing) {
-      const age = this.now().getTime() - existing.lastCalculatedAt.getTime();
-      if (age < RECALC_COOLDOWN_MS) {
-        logger.debug({ userId, ageMs: age }, 'InfluenceScoreService: skipping recalc (cooldown)');
-        return this.toResult(existing, userId);
-      }
-    }
-
-    const components = await computeComponents(userId);
-    const totalScore = compositeScore(components);
-
-    const record = await prisma.influenceScore.upsert({
-      where:  { userId },
-      update: {
-        totalScore,
-        ...components,
-        lastCalculatedAt: this.now(),
-        updatedAt: this.now(),
-      },
-      create: {
-        userId,
-        totalScore,
-        ...components,
-        lastCalculatedAt: this.now(),
-        lastActivityAt:   this.now(),
-      },
-    });
-
-    // Persist daily snapshot
-    await this.persistSnapshot(record.id, totalScore, components);
-
-    logger.info({ userId, totalScore, tier: tierForScore(totalScore) }, 'InfluenceScore updated');
-
-    return this.toResult(record, userId);
-  }
-
-  /**
-   * Return the current score for a user (without triggering a recalculation).
-   * If no record exists, one is created with zero scores.
-   */
-  async getScore(userId: string): Promise<InfluenceScoreResult> {
-    let record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) {
-      record = await prisma.influenceScore.create({
-        data: {
-          userId,
-          totalScore:       0,
-          broadcastQuality: 0,
-          engagementRate:   0,
-          consistency:      0,
-          biometricLevel:   0,
-          crossAppActivity: 0,
-          communityStanding:0,
-          lastCalculatedAt: this.now(),
-          lastActivityAt:   this.now(),
-        },
-      });
-    }
-    return this.toResult(record, userId);
-  }
-
-  /**
-   * Return a paginated leaderboard sorted by totalScore descending.
-   *
-   * @param page     1-based page number.
-   * @param pageSize Results per page (max 100).
-   * @param myUserId Optional: the requesting user's ID, used for rank change.
-   */
-  async getLeaderboard(
-    page: number,
-    pageSize: number,
-    _myUserId?: string,
-  ): Promise<LeaderboardPage> {
-    const take   = Math.min(pageSize, 100);
-    const skip   = (page - 1) * take;
-
-    const [total, rows] = await Promise.all([
-      prisma.influenceScore.count(),
-      prisma.influenceScore.findMany({
-        skip,
-        take: take + 1,
-        orderBy: { totalScore: 'desc' },
-        include: {
-          user: { select: { id: true, displayName: true, avatarUrl: true } },
-        },
-      }),
+    const [
+      averageBroadcastQuality,
+      impressions,
+      views,
+      postStreakDays,
+      postsLast30d,
+      biometricLevel,
+      uniqueQuantAppsUsed,
+      upheldReports,
+      pendingReports,
+      boostPoints,
+    ] = await Promise.all([
+      this.quality.averageQualityForAuthor(userId, this.qualitySampleSize),
+      this.signals.impressionsLast30d(userId),
+      this.signals.viewsLast30d(userId),
+      this.signals.currentPostStreakDays(userId),
+      this.signals.postsLast30d(userId),
+      this.signals.biometricLevel(userId),
+      this.signals.uniqueQuantAppsLast30d(userId),
+      this.store.listUpheldReports(userId).then((r) => r.length),
+      this.store.listPendingReports(userId).then((r) => r.length),
+      this.store.activeBoostPointsFor(userId, now),
     ]);
 
-    const hasNextPage = rows.length > take;
-    const items       = hasNextPage ? rows.slice(0, take) : rows;
-
-    // Compute rank changes by comparing today's score vs yesterday's snapshot
-    const userIds = items.map((r) => r.userId);
-    const yesterday = utcMidnight(new Date(this.now().getTime() - 24 * 60 * 60 * 1000));
-
-    const yesterdaySnapshots = await prisma.scoreHistory.findMany({
-      where: {
-        influenceScore: { userId: { in: userIds } },
-        snapshotDate: yesterday,
-      },
-      select: { score: true, influenceScore: { select: { userId: true } } },
-    });
-
-    const yesterdayMap = new Map<string, number>(
-      yesterdaySnapshots.map((s) => [s.influenceScore.userId, s.score]),
-    );
-
-    // Build rank-sorted list of userIds for yesterday to determine rank change
-    const allScoresYesterday = await prisma.scoreHistory.groupBy({
-      by: ['influenceScoreId'],
-      where: { snapshotDate: yesterday },
-      _max: { score: true },
-    });
-
-    const yesterdayRankList = [...allScoresYesterday]
-      .sort((a, b) => (b._max.score ?? 0) - (a._max.score ?? 0))
-      .map((r) => r.influenceScoreId);
-
-    const influenceIdToUserId = new Map(items.map((r) => [r.id, r.userId]));
-
-    const rankChangeForUser = (userId: string, currentRank: number): number => {
-      const influenceId = items.find((r) => r.userId === userId)?.id;
-      if (!influenceId) return 0;
-      const yesterdayRank = yesterdayRankList.indexOf(influenceId) + 1;
-      if (yesterdayRank === 0) return 0;
-      return yesterdayRank - currentRank; // positive = improved rank
+    const inputs: InfluenceSignalInputs = {
+      userId,
+      averageBroadcastQuality,
+      impressions,
+      views,
+      postStreakDays,
+      postsLast30d,
+      biometricLevel,
+      uniqueQuantAppsUsed,
+      upheldReports,
+      pendingReports,
+      activeBoostPoints: boostPoints,
     };
 
-    // Suppress unused variable warning
-    void influenceIdToUserId;
-    void yesterdayMap;
-
-    const entries: LeaderboardEntry[] = items.map((row, idx) => {
-      const currentRank = skip + idx + 1;
-      return {
-        rank:         currentRank,
-        userId:       row.userId,
-        displayName:  row.user.displayName,
-        avatarUrl:    row.user.avatarUrl,
-        totalScore:   Math.round(row.totalScore),
-        tier:         tierForScore(row.totalScore),
-        rankChange:   rankChangeForUser(row.userId, currentRank),
-      };
-    });
-
-    return { entries, totalUsers: total, page, pageSize: take, hasNextPage };
-  }
-
-  /**
-   * Return the "Nearby" leaderboard — users within ±50 of the given user's score.
-   */
-  async getNearbyLeaderboard(userId: string): Promise<LeaderboardEntry[]> {
-    const me = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!me) return [];
-
-    const lo = Math.max(0, me.totalScore - 50);
-    const hi = Math.min(1000, me.totalScore + 50);
-
-    const rows = await prisma.influenceScore.findMany({
-      where:   { totalScore: { gte: lo, lte: hi } },
-      orderBy: { totalScore: 'desc' },
-      take:    50,
-      include: {
-        user: { select: { id: true, displayName: true, avatarUrl: true } },
-      },
-    });
-
-    return rows.map((row, idx) => ({
-      rank:        idx + 1,
-      userId:      row.userId,
-      displayName: row.user.displayName,
-      avatarUrl:   row.user.avatarUrl,
-      totalScore:  Math.round(row.totalScore),
-      tier:        tierForScore(row.totalScore),
-      rankChange:  0, // simplified for nearby view
-    }));
-  }
-
-  /**
-   * Return the last N days of score history for a user.
-   */
-  async getHistory(userId: string, days = 30): Promise<ScoreHistoryPoint[]> {
-    const record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) return [];
-
-    const since = utcMidnight(new Date(this.now().getTime() - days * 24 * 60 * 60 * 1000));
-
-    const rows = await prisma.scoreHistory.findMany({
-      where:   { influenceScoreId: record.id, snapshotDate: { gte: since } },
-      orderBy: { snapshotDate: 'asc' },
-      select:  {
-        snapshotDate: true,
-        score:        true,
-        broadcastQuality: true,
-        engagementRate:   true,
-        consistency:      true,
-        biometricLevel:   true,
-        crossAppActivity: true,
-        communityStanding:true,
-      },
-    });
-
-    return rows.map((r) => ({
-      date:  isoDateStr(r.snapshotDate),
-      score: Math.round(r.score),
-      components: {
-        broadcastQuality:  Math.round(r.broadcastQuality),
-        engagementRate:    Math.round(r.engagementRate),
-        consistency:       Math.round(r.consistency),
-        biometricLevel:    Math.round(r.biometricLevel),
-        crossAppActivity:  Math.round(r.crossAppActivity),
-        communityStanding: Math.round(r.communityStanding),
-      },
-    }));
-  }
-
-  /**
-   * Start a challenge for the user.  Returns the new challenge details.
-   * A user may only have one ACTIVE challenge of each type at a time.
-   */
-  async startChallenge(
-    userId: string,
-    challengeType?: string,
-  ): Promise<ChallengeResult> {
-    let record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) {
-      record = await prisma.influenceScore.create({
-        data: {
-          userId,
-          totalScore: 0,
-          broadcastQuality: 0,
-          engagementRate: 0,
-          consistency: 0,
-          biometricLevel: 0,
-          crossAppActivity: 0,
-          communityStanding: 0,
-          lastCalculatedAt: this.now(),
-          lastActivityAt: this.now(),
-        },
-      });
-    }
-
-    // Pick a challenge type
-    const type = (
-      AVAILABLE_CHALLENGES.includes(challengeType as typeof AVAILABLE_CHALLENGES[number])
-        ? challengeType
-        : AVAILABLE_CHALLENGES[Math.floor(Math.random() * AVAILABLE_CHALLENGES.length)]
-    ) as typeof AVAILABLE_CHALLENGES[number];
-
-    // Check for existing active challenge of this type
-    const existing = await prisma.influenceChallenge.findFirst({
-      where: {
-        influenceScoreId: record.id,
-        challengeType:    type,
-        status:           'ACTIVE',
-        expiresAt:        { gt: this.now() },
-      },
-    });
-
-    if (existing) {
-      return {
-        challengeId:   existing.id,
-        challengeType: existing.challengeType,
-        boostPoints:   existing.boostPoints,
-        expiresAt:     existing.expiresAt,
-        message:       `Challenge "${type}" already active. Complete it to earn +${existing.boostPoints} boost points.`,
-      };
-    }
-
-    const expiresAt = new Date(this.now().getTime() + CHALLENGE_BOOST_MS);
-
-    const challenge = await prisma.influenceChallenge.create({
-      data: {
-        influenceScoreId: record.id,
-        challengeType:    type,
-        boostPoints:      50,
-        expiresAt,
-        status:           'ACTIVE',
-      },
-    });
-
-    return {
-      challengeId:   challenge.id,
-      challengeType: challenge.challengeType,
-      boostPoints:   challenge.boostPoints,
-      expiresAt:     challenge.expiresAt,
-      message:       `Challenge "${type}" started! Complete within 24 hours to earn +50 boost points.`,
+    const { components, total, tier } = computeScoreFromInputs(inputs);
+    const score: InfluenceScore = {
+      userId,
+      total,
+      components,
+      tier,
+      lastRecalculatedAt: now,
+      boostPoints,
     };
-  }
 
-  /**
-   * Apply any completed challenges to the user's score.
-   * Called internally after recalculate.
-   */
-  async applyActiveChallengeBoosts(userId: string): Promise<number> {
-    const record = await prisma.influenceScore.findUnique({ where: { userId } });
-    if (!record) return 0;
-
-    const activeChallenges = await prisma.influenceChallenge.findMany({
-      where: {
-        influenceScoreId: record.id,
-        status:           'COMPLETED',
-        expiresAt:        { gt: this.now() },
-      },
+    await this.store.upsertScore(score);
+    await this.store.appendHistory({
+      userId,
+      total,
+      components,
+      tier,
+      snapshotAt: now,
     });
+    await this.pruneHistory(now);
 
-    const totalBoost = activeChallenges.reduce((s, c) => s + c.boostPoints, 0);
-    if (totalBoost === 0) return 0;
+    await this.evaluateChallengeProgress(userId, score, inputs);
 
-    const boosted = clamp(record.totalScore + totalBoost, 0, 1000);
-    await prisma.influenceScore.update({
-      where: { id: record.id },
-      data:  { totalScore: boosted },
-    });
-
-    return totalBoost;
-  }
-
-  /**
-   * Expire challenges that have passed their expiry time.
-   */
-  async expireStaleChallenges(): Promise<number> {
-    const result = await prisma.influenceChallenge.updateMany({
-      where: { status: 'ACTIVE', expiresAt: { lte: this.now() } },
-      data:  { status: 'EXPIRED' },
-    });
-    return result.count;
-  }
-
-  /**
-   * Prune score history older than 90 days.
-   */
-  async pruneOldHistory(): Promise<number> {
-    const cutoff = utcMidnight(
-      new Date(this.now().getTime() - HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+    influenceLog(
+      'info',
+      { userId, total, tier, boostPoints },
+      'Influence score recalculated',
     );
-    const result = await prisma.scoreHistory.deleteMany({
-      where: { snapshotDate: { lt: cutoff } },
+
+    return score;
+  }
+
+  /**
+   * Variant for callers that already have complete signal inputs (e.g.
+   * the cron worker that batched them). Skips the per-user signal
+   * fetch but still persists + keeps history in sync.
+   */
+  async recalculateFromInputs(inputs: InfluenceSignalInputs): Promise<InfluenceScore> {
+    this.assertUserId(inputs.userId);
+    const now = this.now();
+    const boostPoints =
+      inputs.activeBoostPoints ?? (await this.store.activeBoostPointsFor(inputs.userId, now));
+    const components = computeComponents(inputs);
+    const total = weightedTotal(components, boostPoints);
+    const tier = tierForTotal(total);
+    const score: InfluenceScore = {
+      userId: inputs.userId,
+      total,
+      components,
+      tier,
+      lastRecalculatedAt: now,
+      boostPoints,
+    };
+    await this.store.upsertScore(score);
+    await this.store.appendHistory({
+      userId: inputs.userId,
+      total,
+      components,
+      tier,
+      snapshotAt: now,
     });
-    return result.count;
+    await this.pruneHistory(now);
+    return score;
   }
 
   // -------------------------------------------------------------------------
-  // Internal helpers
+  // Reads
   // -------------------------------------------------------------------------
 
-  private async persistSnapshot(
-    influenceScoreId: string,
-    score: number,
-    components: ScoreComponents,
-  ): Promise<void> {
-    const today = utcMidnight(this.now());
-    await prisma.scoreHistory.upsert({
-      where:  { influenceScoreId_snapshotDate: { influenceScoreId, snapshotDate: today } },
-      update: { score, ...components },
-      create: { influenceScoreId, score, snapshotDate: today, ...components },
-    });
-  }
-
-  private async toResult(
-    record: {
-      userId: string;
-      totalScore: number;
-      broadcastQuality: number;
-      engagementRate: number;
-      consistency: number;
-      biometricLevel: number;
-      crossAppActivity: number;
-      communityStanding: number;
-      lastCalculatedAt: Date;
-    },
-    userId: string,
-  ): Promise<InfluenceScoreResult> {
-    const rankPosition = await this.getRankPosition(userId);
+  async getBreakdown(userId: string): Promise<InfluenceBreakdown> {
+    this.assertUserId(userId);
+    const now = this.now();
+    let score = await this.store.getScore(userId);
+    if (!score) {
+      score = await this.recalculate(userId);
+    }
+    const activeBoosts = await this.store.listActiveBoosts(userId, now);
+    const descriptor = tierDescriptor(score.tier);
     return {
       userId,
-      totalScore: Math.round(record.totalScore),
-      components: {
-        broadcastQuality:  Math.round(record.broadcastQuality),
-        engagementRate:    Math.round(record.engagementRate),
-        consistency:       Math.round(record.consistency),
-        biometricLevel:    Math.round(record.biometricLevel),
-        crossAppActivity:  Math.round(record.crossAppActivity),
-        communityStanding: Math.round(record.communityStanding),
-      },
-      tier:             tierForScore(record.totalScore),
-      rankPosition,
-      lastCalculatedAt: record.lastCalculatedAt,
+      total: score.total,
+      tier: score.tier,
+      tierMin: descriptor.min,
+      tierMax: descriptor.max,
+      tierAccentColor: descriptor.accentColor,
+      tierLabel: descriptor.label,
+      components: score.components,
+      weights: INFLUENCE_COMPONENT_WEIGHTS,
+      activeBoostPoints: score.boostPoints,
+      activeBoosts,
+      lastRecalculatedAt: score.lastRecalculatedAt,
     };
   }
 
-  private async getRankPosition(userId: string): Promise<number | null> {
-    const me = await prisma.influenceScore.findUnique({
-      where:  { userId },
-      select: { totalScore: true },
+  async getHistory(
+    userId: string,
+    days: number = DEFAULT_HISTORY_DAYS,
+  ): Promise<readonly InfluenceScoreSnapshot[]> {
+    this.assertUserId(userId);
+    const window = clamp(days, 1, this.historyWindowDays);
+    return this.store.listHistory(userId, window);
+  }
+
+  async getLeaderboard(
+    page: number,
+    pageSize: number = 20,
+  ): Promise<LeaderboardPage> {
+    if (!Number.isInteger(page) || page < 0) {
+      throw new Error('getLeaderboard: page must be a non-negative integer.');
+    }
+    const clampedSize = clamp(pageSize, 1, this.maxLeaderboardPage);
+    const total = await this.store.countScores();
+    const cursor = page * clampedSize;
+    const scores = await this.store.listScoresOrdered(clampedSize, cursor);
+    const rows: LeaderboardRow[] = scores.map((s, i) => {
+      const d = tierDescriptor(s.tier);
+      return {
+        userId: s.userId,
+        rank: cursor + i + 1,
+        total: s.total,
+        tier: s.tier,
+        tierLabel: d.label,
+        tierAccentColor: d.accentColor,
+      };
     });
-    if (!me) return null;
-    const above = await prisma.influenceScore.count({
-      where: { totalScore: { gt: me.totalScore } },
+    const nextCursor = cursor + scores.length < total ? page + 1 : null;
+    return { rows, total, nextCursor };
+  }
+
+  async getNearby(userId: string, limit: number = 20): Promise<readonly LeaderboardRow[]> {
+    this.assertUserId(userId);
+    const rows = await this.store.listScoresNear(
+      userId,
+      this.nearbySpread,
+      clamp(limit, 1, this.maxLeaderboardPage),
+    );
+    return rows.map((s, i) => {
+      const d = tierDescriptor(s.tier);
+      return {
+        userId: s.userId,
+        rank: i + 1,
+        total: s.total,
+        tier: s.tier,
+        tierLabel: d.label,
+        tierAccentColor: d.accentColor,
+      };
     });
-    return above + 1;
+  }
+
+  async rankFor(userId: string): Promise<number | null> {
+    this.assertUserId(userId);
+    const target = await this.store.getScore(userId);
+    if (!target) return null;
+    // Linear walk keeps the default in-memory impl simple; a Postgres
+    // adapter should override this with a window-function query.
+    let cursor = 0;
+    const pageSize = 200;
+    for (;;) {
+      const rows = await this.store.listScoresOrdered(pageSize, cursor);
+      if (rows.length === 0) return null;
+      const idx = rows.findIndex((r) => r.userId === userId);
+      if (idx >= 0) return cursor + idx + 1;
+      if (rows.length < pageSize) return null;
+      cursor += pageSize;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Reports
+  // -------------------------------------------------------------------------
+
+  async fileReport(
+    reporterId: string,
+    reportedId: string,
+    reason: string,
+  ): Promise<UserReportRecord> {
+    this.assertUserId(reporterId);
+    this.assertUserId(reportedId);
+    if (reporterId === reportedId) {
+      throw new Error('InfluenceScoreService: users cannot report themselves.');
+    }
+    if (!reason || reason.length < 3) {
+      throw new Error('InfluenceScoreService: report reason must be at least 3 characters.');
+    }
+    return this.store.recordReport({ reporterId, reportedId, reason });
+  }
+
+  // -------------------------------------------------------------------------
+  // Boosts + challenges
+  // -------------------------------------------------------------------------
+
+  async startChallenge(
+    userId: string,
+    kind: InfluenceChallengeKind,
+    template?: ChallengeTemplate,
+  ): Promise<InfluenceChallenge> {
+    this.assertUserId(userId);
+    const tpl = template ?? DEFAULT_CHALLENGE_TEMPLATES[kind];
+    if (!tpl) throw new Error(`Unknown challenge kind: ${kind}`);
+    const existing = await this.store.listChallenges(userId);
+    const alreadyActive = existing.find((c) => c.kind === kind && c.status === 'ACTIVE');
+    if (alreadyActive) return alreadyActive;
+
+    const now = this.now();
+    const expiresAt = new Date(now.getTime() + tpl.durationHours * 3_600_000);
+    return this.store.createChallenge({
+      ownerId: userId,
+      kind,
+      status: 'ACTIVE',
+      progress: 0,
+      target: tpl.target,
+      rewardPoints: tpl.rewardPoints,
+      startedAt: now,
+      expiresAt,
+      completedAt: null,
+    });
+  }
+
+  async listChallenges(userId: string): Promise<readonly InfluenceChallenge[]> {
+    this.assertUserId(userId);
+    return this.store.listChallenges(userId);
+  }
+
+  async progressChallenge(
+    userId: string,
+    kind: InfluenceChallengeKind,
+    delta: number,
+  ): Promise<InfluenceChallenge | null> {
+    this.assertUserId(userId);
+    if (!Number.isFinite(delta) || delta <= 0) return null;
+    const now = this.now();
+    const challenges = await this.store.listChallenges(userId);
+    const active = challenges.find((c) => c.kind === kind && c.status === 'ACTIVE');
+    if (!active) return null;
+    if (active.expiresAt.getTime() < now.getTime()) {
+      return this.store.updateChallenge(active.id, { status: 'EXPIRED' });
+    }
+    const nextProgress = Math.min(active.target, active.progress + delta);
+    if (nextProgress >= active.target) {
+      const completed = await this.store.updateChallenge(active.id, {
+        progress: active.target,
+        status: 'COMPLETED',
+        completedAt: now,
+      });
+      await this.grantBoost(userId, `challenge:${kind}`, active.rewardPoints, 24);
+      return completed;
+    }
+    return this.store.updateChallenge(active.id, { progress: nextProgress });
+  }
+
+  async cancelChallenge(challengeId: string): Promise<InfluenceChallenge> {
+    return this.store.updateChallenge(challengeId, {
+      status: 'CANCELLED',
+    });
+  }
+
+  /**
+   * Grant a boost event worth `points` which expires in `hours`.
+   * The boost is automatically added to the next recalculation.
+   */
+  async grantBoost(
+    userId: string,
+    reason: string,
+    points: number,
+    hours: number,
+  ): Promise<BoostEvent> {
+    this.assertUserId(userId);
+    if (!Number.isFinite(points) || points <= 0) {
+      throw new Error('InfluenceScoreService.grantBoost: points must be positive.');
+    }
+    if (!Number.isFinite(hours) || hours <= 0) {
+      throw new Error('InfluenceScoreService.grantBoost: hours must be positive.');
+    }
+    const now = this.now();
+    const boost = await this.store.createBoost({
+      userId,
+      reason,
+      points: Math.round(points),
+      startsAt: now,
+      expiresAt: new Date(now.getTime() + hours * 3_600_000),
+      consumedAt: null,
+    });
+    influenceLog(
+      'info',
+      { userId, reason, points: boost.points, expiresAt: boost.expiresAt },
+      'Influence boost granted',
+    );
+    return boost;
+  }
+
+  // -------------------------------------------------------------------------
+  // Background scheduling
+  // -------------------------------------------------------------------------
+
+  /**
+   * Start a recurring recalculation timer. Safe to call more than once
+   * — subsequent calls are no-ops until `stop()` is invoked.
+   */
+  start(): void {
+    if (this.recalcTimer) return;
+    this.recalcTimer = setInterval(() => {
+      this.tick().catch((err) => {
+        influenceLog(
+          'error',
+          { error: (err as Error).message },
+          'InfluenceScoreService tick failed',
+        );
+      });
+    }, this.recalcIntervalMs);
+    unrefTimer(this.recalcTimer);
+    influenceLog('info', { intervalMs: this.recalcIntervalMs }, 'InfluenceScoreService started');
+  }
+
+  stop(): void {
+    if (this.recalcTimer) {
+      clearInterval(this.recalcTimer);
+      this.recalcTimer = null;
+      influenceLog('info', {}, 'InfluenceScoreService stopped');
+    }
+  }
+
+  /**
+   * Run a single recalculation tick over the batch of stalest users.
+   * Exposed for tests + the cron worker.
+   */
+  async tick(): Promise<{ recalculated: number }> {
+    const now = this.now();
+    const cutoff = new Date(now.getTime() - this.recalcIntervalMs);
+    const users = await this.store.listUsersWithScoreOlderThan(cutoff, this.recalcBatchSize);
+    let count = 0;
+    for (const userId of users) {
+      try {
+        await this.recalculate(userId);
+        count += 1;
+      } catch (err) {
+        influenceLog(
+          'error',
+          { userId, error: (err as Error).message },
+          'InfluenceScoreService failed to recalc user',
+        );
+      }
+    }
+    await this.pruneHistory(now);
+    return { recalculated: count };
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  private async pruneHistory(now: Date): Promise<void> {
+    const cutoff = new Date(now.getTime() - this.historyWindowDays * 86_400_000);
+    const removed = await this.store.pruneHistoryOlderThan(cutoff);
+    if (removed > 0) {
+      influenceLog('debug', { removed, cutoff }, 'Influence history pruned');
+    }
+  }
+
+  private async evaluateChallengeProgress(
+    userId: string,
+    score: InfluenceScore,
+    inputs: InfluenceSignalInputs,
+  ): Promise<void> {
+    const now = this.now();
+    const challenges = await this.store.listChallenges(userId);
+    for (const challenge of challenges) {
+      if (challenge.status !== 'ACTIVE') continue;
+      if (challenge.expiresAt.getTime() < now.getTime()) {
+        await this.store.updateChallenge(challenge.id, { status: 'EXPIRED' });
+        continue;
+      }
+      const nextProgress = this.challengeProgressFromSignals(challenge, inputs, score);
+      if (nextProgress <= challenge.progress) continue;
+      if (nextProgress >= challenge.target) {
+        await this.store.updateChallenge(challenge.id, {
+          progress: challenge.target,
+          status: 'COMPLETED',
+          completedAt: now,
+        });
+        await this.grantBoost(userId, `challenge:${challenge.kind}`, challenge.rewardPoints, 24);
+      } else {
+        await this.store.updateChallenge(challenge.id, { progress: nextProgress });
+      }
+    }
+  }
+
+  private challengeProgressFromSignals(
+    challenge: InfluenceChallenge,
+    inputs: InfluenceSignalInputs,
+    score: InfluenceScore,
+  ): number {
+    switch (challenge.kind) {
+      case 'POST_STREAK':
+        return Math.min(challenge.target, inputs.postStreakDays);
+      case 'CROSS_APP_EXPLORER':
+        return Math.min(challenge.target, inputs.uniqueQuantAppsUsed);
+      case 'BIOMETRIC_WEEK':
+        return Math.min(challenge.target, Math.round(inputs.biometricLevel / 20));
+      case 'QUALITY_AUTHOR':
+        return Math.min(
+          challenge.target,
+          Math.max(challenge.progress, score.components.broadcastQuality >= 80 ? challenge.progress + 1 : challenge.progress),
+        );
+      case 'COMMUNITY_UPLIFT':
+        return Math.min(
+          challenge.target,
+          Math.max(challenge.progress, score.components.communityStanding >= 90 ? challenge.progress + 1 : challenge.progress),
+        );
+      default:
+        return challenge.progress;
+    }
+  }
+
+  private assertUserId(userId: string): void {
+    if (!userId || typeof userId !== 'string') {
+      throw new Error('InfluenceScoreService: userId is required.');
+    }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Re-exports used by the HTTP route
+// ---------------------------------------------------------------------------
+
+export {
+  INFLUENCE_COMPONENT_WEIGHTS,
+  INFLUENCE_TIER_THRESHOLDS,
+  tierDescriptor,
+  tierForTotal,
+};
+
+export type {
+  InfluenceChallenge,
+  InfluenceChallengeKind,
+  InfluenceScore,
+  InfluenceScoreSnapshot,
+  InfluenceSignalInputs,
+  InfluenceStore,
+  InfluenceTier,
+};
 
 export default InfluenceScoreService;

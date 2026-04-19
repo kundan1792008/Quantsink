@@ -21,8 +21,6 @@ declare global {
   }
 }
 
-const QUANTMAIL_JWT_SECRET = process.env.QUANTMAIL_JWT_SECRET ?? '';
-
 /**
  * Biometric SSO middleware.
  *
@@ -44,14 +42,15 @@ export function requireAuth(
 
   const token = authHeader.slice(7);
 
-  if (!QUANTMAIL_JWT_SECRET) {
+  const secret = process.env.QUANTMAIL_JWT_SECRET;
+  if (!secret) {
     logger.error('QUANTMAIL_JWT_SECRET is not configured');
     res.status(500).json({ error: 'Server misconfiguration' });
     return;
   }
 
   try {
-    const payload = jwt.verify(token, QUANTMAIL_JWT_SECRET) as QuantmailJwtPayload;
+    const payload = jwt.verify(token, secret) as QuantmailJwtPayload;
 
     if (!payload.biometricVerified) {
       res.status(403).json({ error: 'Biometric verification required' });
