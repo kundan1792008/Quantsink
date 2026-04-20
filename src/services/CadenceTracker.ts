@@ -31,9 +31,13 @@ export interface CadenceTrackerConfig {
 }
 
 const DEFAULT_CONFIG: Required<CadenceTrackerConfig> = {
+  // Keep short-term scroll texture while smoothing out micro-jitter.
   velocityWindowMs: 4_500,
+  // Capture broader interaction cadence across reading/scanning cycles.
   interactionWindowMs: 12_000,
+  // Pause >3s is treated as deep-read ambient intent.
   ambientPauseThresholdMs: 3_000,
+  // Gentle smoothing so transitions remain fluid instead of abrupt.
   smoothingFactor: 0.24,
 };
 
@@ -41,6 +45,12 @@ const MIN_BPM = 52;
 const MAX_BPM = 136;
 const MIN_FM_HZ = 0.06;
 const MAX_FM_HZ = 1.8;
+const MAX_SCROLL_VELOCITY_NORM_PX_PER_SEC = 2_200;
+const MAX_INTERACTION_FREQUENCY_NORM_HZ = 2.2;
+const MAX_PAUSE_NORM_MS = 6_000;
+const VELOCITY_WEIGHT = 0.68;
+const FREQUENCY_WEIGHT = 0.42;
+const PAUSE_PENALTY_WEIGHT = 0.38;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -168,11 +178,17 @@ export class CadenceTracker {
   }
 
   private mapMetricsToMusic(metrics: CadenceMetrics): MusicalParameters {
-    const velocityNorm = clamp(metrics.scrollVelocityPxPerSec / 2_200, 0, 1);
-    const frequencyNorm = clamp(metrics.interactionFrequencyHz / 2.2, 0, 1);
-    const pauseNorm = clamp(metrics.pauseDurationMs / 6_000, 0, 1);
+    const velocityNorm = clamp(metrics.scrollVelocityPxPerSec / MAX_SCROLL_VELOCITY_NORM_PX_PER_SEC, 0, 1);
+    const frequencyNorm = clamp(metrics.interactionFrequencyHz / MAX_INTERACTION_FREQUENCY_NORM_HZ, 0, 1);
+    const pauseNorm = clamp(metrics.pauseDurationMs / MAX_PAUSE_NORM_MS, 0, 1);
 
-    const pulseIntensity = clamp(velocityNorm * 0.68 + frequencyNorm * 0.42 - pauseNorm * 0.38, 0, 1);
+    const pulseIntensity = clamp(
+      velocityNorm * VELOCITY_WEIGHT +
+      frequencyNorm * FREQUENCY_WEIGHT -
+      pauseNorm * PAUSE_PENALTY_WEIGHT,
+      0,
+      1,
+    );
 
     const bpm = lerp(MIN_BPM, MAX_BPM, clamp(velocityNorm * 0.8 + frequencyNorm * 0.2, 0, 1));
     const frequencyModulationHz = lerp(

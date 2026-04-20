@@ -55,6 +55,9 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+const MIN_PULSE_INTERVAL_MS = 130;
+const MAX_PULSE_INTERVAL_MS = 1_600;
+
 function safeStop(osc: OscillatorNodeLike): void {
   try {
     osc.stop();
@@ -183,7 +186,12 @@ export class AudioSynth {
     if (mode === 'ambient' || p.rhythmDensity < 0.12) {
       this.stopPulseLoop();
     } else {
-      const interval = clamp(Math.round((60_000 / p.bpm) / 2), 130, 1_600);
+      // Use half-beat pulses to keep rhythmic detail responsive during fast scrolling.
+      const interval = clamp(
+        Math.round((60_000 / p.bpm) / 2),
+        MIN_PULSE_INTERVAL_MS,
+        MAX_PULSE_INTERVAL_MS,
+      );
       if (!this.pulseLoop || interval !== this.pulseIntervalMs) {
         this.startPulseLoop(interval);
       }
@@ -209,6 +217,7 @@ export class AudioSynth {
       const density = this.lastParameters.rhythmDensity;
 
       osc.type = 'square';
+      // Keep percussive pulses in a warm low-mid band that remains subtle under ambient pads.
       osc.frequency.value = clamp(140 + density * 240, 140, 420);
 
       gain.gain.value = 0.0001;

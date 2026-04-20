@@ -39,6 +39,7 @@ interface FeedNode {
 // ---------------------------------------------------------------------------
 
 const VELOCITY_THRESHOLD = 180;
+const CADENCE_UPDATE_INTERVAL_MS = 950;
 
 /** Estimated rendered height per card in pixels (used for virtual windowing). */
 const CARD_HEIGHT_EST = 148;
@@ -349,6 +350,8 @@ export default function InterestGraphFeed() {
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const cadenceTrackerRef = useRef<CadenceTracker | null>(null);
   const audioSynthRef = useRef<AudioSynth | null>(null);
+  const audioActivatedRef = useRef(false);
+  const flowModeRef = useRef<"ambient" | "pulse" | "off">("off");
 
   const { scrollY } = useScroll();
   const scrollVelocity = useVelocity(scrollY);
@@ -392,52 +395,54 @@ export default function InterestGraphFeed() {
     const cadence = cadenceTrackerRef.current;
     if (cadence) {
       cadence.recordScrollVelocity(v);
-      const state = cadence.getState();
-      audioSynthRef.current?.applyCadence(state.parameters, state.mode);
-      setFlowMode(state.mode);
     }
     setReadingMode(Math.abs(v) < VELOCITY_THRESHOLD);
   }, []));
 
   // ---- Ambient generative audio engine ----
   useEffect(() => {
-    const audioContext = createBrowserAudioContext();
-    if (!audioContext) {
-      setFlowMode("off");
-      return;
-    }
-
     const cadence = new CadenceTracker();
-    const synth = new AudioSynth({ audioContext });
     cadenceTrackerRef.current = cadence;
-    audioSynthRef.current = synth;
+    let synth: AudioSynth | null = null;
 
-    let activated = false;
     const activate = () => {
-      if (activated) return;
-      activated = true;
+      if (audioActivatedRef.current) return;
+      const audioContext = createBrowserAudioContext();
+      if (!audioContext) {
+        setFlowMode("off");
+        return;
+      }
+      synth = new AudioSynth({ audioContext });
+      audioSynthRef.current = synth;
+      audioActivatedRef.current = true;
       synth.start();
       cadence.recordInteraction();
       const state = cadence.getState();
       synth.applyCadence(state.parameters, state.mode);
+      flowModeRef.current = state.mode;
       setFlowMode(state.mode);
     };
 
-    const pulseTimer = setInterval(() => {
-      if (!activated) return;
+    const cadenceUpdateTimer = setInterval(() => {
+      if (!audioActivatedRef.current) return;
       const state = cadence.getState();
-      synth.applyCadence(state.parameters, state.mode);
-      setFlowMode(state.mode);
-    }, 700);
+      synth?.applyCadence(state.parameters, state.mode);
+      if (flowModeRef.current !== state.mode) {
+        flowModeRef.current = state.mode;
+        setFlowMode(state.mode);
+      }
+    }, CADENCE_UPDATE_INTERVAL_MS);
 
     window.addEventListener("pointerdown", activate, { passive: true });
     window.addEventListener("keydown", activate);
 
     return () => {
-      clearInterval(pulseTimer);
+      clearInterval(cadenceUpdateTimer);
       window.removeEventListener("pointerdown", activate);
       window.removeEventListener("keydown", activate);
-      synth.stop();
+      synth?.stop();
+      audioActivatedRef.current = false;
+      flowModeRef.current = "off";
       cadenceTrackerRef.current = null;
       audioSynthRef.current = null;
     };
@@ -460,9 +465,9 @@ export default function InterestGraphFeed() {
     if (!el) return;
     let ticking = false;
     const onScroll = () => {
-      cadenceTrackerRef.current?.recordInteraction();
       if (!ticking) {
         requestAnimationFrame(() => {
+          cadenceTrackerRef.current?.recordInteraction();
           setScrollTop(el.scrollTop);
           ticking = false;
         });
