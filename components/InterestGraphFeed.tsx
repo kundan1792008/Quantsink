@@ -16,6 +16,8 @@ import {
   useMotionValueEvent,
 } from "framer-motion";
 import { useWebSocketFeed } from "@/hooks/useWebSocketFeed";
+import { CadenceTracker } from "@/src/services/CadenceTracker";
+import { AudioSynth, createBrowserAudioContext } from "@/src/services/AudioSynth";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,6 +39,7 @@ interface FeedNode {
 // ---------------------------------------------------------------------------
 
 const VELOCITY_THRESHOLD = 180;
+const CADENCE_UPDATE_INTERVAL_MS = 950;
 
 /** Estimated rendered height per card in pixels (used for virtual windowing). */
 const CARD_HEIGHT_EST = 148;
@@ -345,10 +348,15 @@ function LiveBadge({ visible }: { visible: boolean }) {
 export default function InterestGraphFeed() {
   const containerRef  = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const cadenceTrackerRef = useRef<CadenceTracker | null>(null);
+  const audioSynthRef = useRef<AudioSynth | null>(null);
+  const audioActivatedRef = useRef(false);
+  const flowModeRef = useRef<"ambient" | "pulse" | "off">("off");
 
   const { scrollY } = useScroll();
   const scrollVelocity = useVelocity(scrollY);
   const [readingMode, setReadingMode] = useState(true);
+  const [flowMode, setFlowMode] = useState<"ambient" | "pulse" | "off">("off");
 
   // Live-push state: prepend new nodes from WebSocket
   const [liveNodes, setLiveNodes]         = useState<FeedNode[]>([]);
@@ -384,8 +392,61 @@ export default function InterestGraphFeed() {
 
   // ---- Velocity → reading-mode toggle ----
   useMotionValueEvent(scrollVelocity, "change", useCallback((v: number) => {
+    const cadence = cadenceTrackerRef.current;
+    if (cadence) {
+      cadence.recordScrollVelocity(v);
+    }
     setReadingMode(Math.abs(v) < VELOCITY_THRESHOLD);
   }, []));
+
+  // ---- Ambient generative audio engine ----
+  useEffect(() => {
+    const cadence = new CadenceTracker();
+    cadenceTrackerRef.current = cadence;
+    let synth: AudioSynth | null = null;
+
+    const activate = () => {
+      if (audioActivatedRef.current) return;
+      const audioContext = createBrowserAudioContext();
+      if (!audioContext) {
+        setFlowMode("off");
+        return;
+      }
+      synth = new AudioSynth({ audioContext });
+      audioSynthRef.current = synth;
+      audioActivatedRef.current = true;
+      synth.start();
+      cadence.recordInteraction();
+      const state = cadence.getState();
+      synth.applyCadence(state.parameters, state.mode);
+      flowModeRef.current = state.mode;
+      setFlowMode(state.mode);
+    };
+
+    const cadenceUpdateTimer = setInterval(() => {
+      if (!audioActivatedRef.current) return;
+      const state = cadence.getState();
+      synth?.applyCadence(state.parameters, state.mode);
+      if (flowModeRef.current !== state.mode) {
+        flowModeRef.current = state.mode;
+        setFlowMode(state.mode);
+      }
+    }, CADENCE_UPDATE_INTERVAL_MS);
+
+    window.addEventListener("pointerdown", activate, { passive: true });
+    window.addEventListener("keydown", activate);
+
+    return () => {
+      clearInterval(cadenceUpdateTimer);
+      window.removeEventListener("pointerdown", activate);
+      window.removeEventListener("keydown", activate);
+      synth?.stop();
+      audioActivatedRef.current = false;
+      flowModeRef.current = "off";
+      cadenceTrackerRef.current = null;
+      audioSynthRef.current = null;
+    };
+  }, []);
 
   // ---- Measure scroll area height ----
   useEffect(() => {
@@ -406,6 +467,7 @@ export default function InterestGraphFeed() {
     const onScroll = () => {
       if (!ticking) {
         requestAnimationFrame(() => {
+          cadenceTrackerRef.current?.recordInteraction();
           setScrollTop(el.scrollTop);
           ticking = false;
         });
@@ -451,6 +513,20 @@ export default function InterestGraphFeed() {
             }}
           >
             {readingMode ? "Reading Mode" : "Scanning"}
+          </span>
+          <span
+            className="text-[9px] tracking-widest px-2 py-0.5 rounded-sm uppercase font-semibold transition-colors duration-300"
+            style={{
+              color: flowMode === "off" ? "#7A7A7A" : flowMode === "ambient" ? "#89B6FF" : "#D8A2FF",
+              backgroundColor: flowMode === "off"
+                ? "transparent"
+                : flowMode === "ambient"
+                  ? "rgba(137,182,255,0.08)"
+                  : "rgba(216,162,255,0.08)",
+              border: `1px solid ${flowMode === "off" ? "#1E1E1E" : flowMode === "ambient" ? "rgba(137,182,255,0.24)" : "rgba(216,162,255,0.24)"}`,
+            }}
+          >
+            {flowMode === "off" ? "Audio Off" : flowMode === "ambient" ? "Ambient Pad" : "Pulse Cadence"}
           </span>
           <LiveBadge visible={showLiveBadge} />
         </div>
