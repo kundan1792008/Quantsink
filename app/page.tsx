@@ -4,7 +4,6 @@ import BroadcastDashboard from "@/components/BroadcastDashboard";
 import BroadcastComposer from "@/components/BroadcastComposer";
 import AddictionEngineDeck from "@/components/addiction/AddictionEngineDeck";
 import ZeroLoadFeed from "@/components/ZeroLoadFeed";
-import EngagementMilestones from "@/src/components/EngagementMilestones";
 
 export default function Home() {
   return (
@@ -12,7 +11,6 @@ export default function Home() {
       <VIPTray />
       <div className="pt-[88px]">
         <BroadcastDashboard />
-        <EngagementMilestones currentInteractions={87} dailyGoal={120} />
         <AddictionEngineDeck />
         <ZeroLoadFeed userId="anonymous" />
         <InterestGraphFeed />

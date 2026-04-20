@@ -26,10 +26,17 @@ export default function EngagementMilestones({
   const offset = circumference * (1 - ratio);
 
   return (
-    <section className="max-w-2xl mx-auto px-4 pb-8" aria-label="Engagement milestones">
-      <div className="rounded-sm border border-brand-border bg-[#111111] p-4">
+    <section
+      className="max-w-2xl mx-auto px-4 pb-8"
+      aria-label="Engagement milestones"
+      style={{ fontFamily: '"Inter", "Geist", system-ui, sans-serif' }}
+    >
+      <div className="rounded-sm border border-brand-border bg-[#0A0A0A] p-4">
         <div className="flex items-center justify-between gap-3 mb-4">
-          <h2 className="text-[12px] tracking-[0.2em] uppercase text-brand-subtext font-semibold">
+          <h2
+            className="text-[12px] tracking-[0.2em] uppercase text-brand-subtext font-semibold"
+            style={{ fontFamily: '"Austin Roman", "Times New Roman", "Georgia", serif' }}
+          >
             Engagement Milestones
           </h2>
           <span className="text-[11px] text-brand-subtext tabular-nums">

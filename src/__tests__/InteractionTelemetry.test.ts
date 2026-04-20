@@ -13,7 +13,7 @@ describe('InteractionTelemetry', () => {
       new Date(base.getTime() + 9_000),
     );
 
-    expect(feedback.reason).toBe('dwell_positive');
+    expect(feedback.reason).toBe('dwellPositive');
     expect(feedback.nextWeight).toBeGreaterThan(feedback.previousWeight);
     expect(feedback.feedbackLoopMs).toBeLessThan(50);
     expect(telemetry.getWeight('c1')).toBe(feedback.nextWeight);
@@ -36,7 +36,7 @@ describe('InteractionTelemetry', () => {
 
     const feedback = telemetry.rapidExit('u1', 'c3');
 
-    expect(feedback.reason).toBe('rapid_exit');
+    expect(feedback.reason).toBe('rapidExit');
     expect(feedback.nextWeight).toBeLessThan(before);
   });
 });

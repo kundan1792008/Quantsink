@@ -4,10 +4,10 @@ export interface TelemetryFeedback {
   readonly userId: string;
   readonly contentId: string;
   readonly reason:
-    | 'dwell_positive'
-    | 'dwell_negative'
-    | 'micro_hesitation'
-    | 'rapid_exit';
+    | 'dwellPositive'
+    | 'dwellNegative'
+    | 'microHesitation'
+    | 'rapidExit';
   readonly previousWeight: number;
   readonly nextWeight: number;
   readonly delta: number;
@@ -70,7 +70,7 @@ export class InteractionTelemetry {
     return this.applyFeedback(
       userId,
       contentId,
-      positive ? 'dwell_positive' : 'dwell_negative',
+      positive ? 'dwellPositive' : 'dwellNegative',
       delta,
     );
   }
@@ -109,7 +109,7 @@ export class InteractionTelemetry {
     });
 
     if (activeContentId && microHesitation) {
-      this.applyFeedback(userId, activeContentId, 'micro_hesitation', 0.08);
+      this.applyFeedback(userId, activeContentId, 'microHesitation', 0.08);
     }
 
     return { velocityPxPerSec, microHesitation };
@@ -117,7 +117,7 @@ export class InteractionTelemetry {
 
   rapidExit(userId: string, contentId: string): TelemetryFeedback {
     this.dwellStarts.delete(`${userId}:${contentId}`);
-    return this.applyFeedback(userId, contentId, 'rapid_exit', -0.25);
+    return this.applyFeedback(userId, contentId, 'rapidExit', -0.25);
   }
 
   getWeight(contentId: string): number {
