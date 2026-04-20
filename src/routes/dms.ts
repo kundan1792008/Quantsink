@@ -33,7 +33,13 @@ router.post('/', requireAuth, async (req: Request, res: Response, next: NextFunc
     }
 
     const { receiverId, content } = parsed.data;
-    const sender = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const sender = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!sender) { res.status(404).json({ error: 'Sender profile not found' }); return; }
 
     const receiver = await prisma.user.findUnique({ where: { id: receiverId } });
@@ -117,7 +123,12 @@ router.get('/inbox', requireAuth, async (req: Request, res: Response, next: Next
       return;
     }
 
-    const user = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
     const { page, limit } = parsed.data;
@@ -146,7 +157,12 @@ router.get('/shadow', requireAuth, async (req: Request, res: Response, next: Nex
       return;
     }
 
-    const user = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
     const { page, limit } = parsed.data;

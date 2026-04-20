@@ -16,7 +16,7 @@ const app = express();
 // ---------------------------------------------------------------------------
 // Global middleware
 // ---------------------------------------------------------------------------
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Add explicit size limit
 app.use(pinoHttp({ logger }));
 
 // Zero-Reply Protocol guard — applied before all write routes

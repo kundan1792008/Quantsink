@@ -46,6 +46,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       body: JSON.stringify(body),
     });
 
+    if (!upstream.ok) {
+      const errorData = await upstream.json().catch(() => ({ error: 'Upstream request failed' }));
+      return NextResponse.json(errorData, { status: upstream.status });
+    }
+
     const data = await upstream.json();
     return NextResponse.json(data, { status: upstream.status });
   } catch {
@@ -75,6 +80,12 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const upstream = await fetch(upstreamUrl.toString(), {
       headers: { Authorization: authHeader },
     });
+
+    if (!upstream.ok) {
+      const errorData = await upstream.json().catch(() => ({ error: 'Upstream request failed' }));
+      return NextResponse.json(errorData, { status: upstream.status });
+    }
+
     const data = await upstream.json();
     return NextResponse.json(data, { status: upstream.status });
   } catch {

@@ -1,4 +1,5 @@
 import logger from '../lib/logger';
+import { z } from 'zod';
 
 /**
  * QuantmailLivenessService
@@ -15,6 +16,10 @@ import logger from '../lib/logger';
  * check is bypassed and the function returns `true` immediately so that
  * developers can test without a live Quantmail instance.
  */
+
+const LivenessResponseSchema = z.object({
+  active: z.boolean(),
+});
 
 export class QuantmailLivenessService {
   private readonly baseUrl: string;
@@ -57,8 +62,15 @@ export class QuantmailLivenessService {
       });
 
       if (res.ok) {
-        const body = await res.json() as { active?: boolean };
-        const active = body.active === true;
+        const rawBody = await res.json();
+        const parsed = LivenessResponseSchema.safeParse(rawBody);
+
+        if (!parsed.success) {
+          logger.warn({ userId, rawBody, errors: parsed.error }, 'QuantmailLiveness: invalid response format, denying broadcast');
+          return false;
+        }
+
+        const active = parsed.data.active;
         logger.info({ userId, active }, 'QuantmailLiveness: grid status received');
         return active;
       }

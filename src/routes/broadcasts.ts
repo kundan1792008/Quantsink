@@ -35,7 +35,13 @@ router.post('/', requireAuth, async (req: Request, res: Response, next: NextFunc
     }
 
     const { content, biometricHash } = parsed.data;
-    const userId = req.user!.sub;
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const userId = req.user.sub;
 
     // Upsert author so the first broadcast from a new user auto-creates their profile
     await prisma.user.upsert({
@@ -43,12 +49,16 @@ router.post('/', requireAuth, async (req: Request, res: Response, next: NextFunc
       update: {},
       create: {
         quantmailId: userId,
-        email:       req.user!.email,
-        displayName: req.user!.displayName ?? req.user!.email,
+        email:       req.user.email,
+        displayName: req.user.displayName ?? req.user.email,
       },
     });
 
-    const author = await prisma.user.findUniqueOrThrow({ where: { quantmailId: userId } });
+    const author = await prisma.user.findUnique({ where: { quantmailId: userId } });
+    if (!author) {
+      res.status(500).json({ error: 'Failed to create or retrieve user profile' });
+      return;
+    }
 
     const broadcast = await prisma.broadcast.create({
       data: {
@@ -130,7 +140,12 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
 // ---------------------------------------------------------------------------
 router.delete('/:id', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const userId = req.user!.sub;
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const userId = req.user.sub;
 
     const author = await prisma.user.findUnique({ where: { quantmailId: userId } });
     if (!author) {
