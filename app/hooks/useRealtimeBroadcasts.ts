@@ -58,6 +58,21 @@ export function useRealtimeBroadcasts(): RealtimeBroadcastsState {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const unmountedRef   = useRef(false);
 
+  const scheduleReconnect = useCallback(() => {
+    if (unmountedRef.current) return;
+    attemptsRef.current += 1;
+    setConnectionAttempts(attemptsRef.current);
+
+    const delay = Math.min(
+      BASE_BACKOFF_MS * Math.pow(2, attemptsRef.current - 1),
+      MAX_BACKOFF_MS,
+    );
+
+    reconnectTimer.current = setTimeout(() => {
+      if (!unmountedRef.current) connect();
+    }, delay);
+  }, []); // Empty deps - uses ref for connect call
+
   const connect = useCallback(() => {
     if (unmountedRef.current) return;
 
@@ -102,22 +117,7 @@ export function useRealtimeBroadcasts(): RealtimeBroadcastsState {
     ws.onerror = () => {
       // onclose fires immediately after; no additional action needed
     };
-  }, [scheduleReconnect]); // Fixed: added scheduleReconnect dependency
-
-  const scheduleReconnect = useCallback(() => {
-    if (unmountedRef.current) return;
-    attemptsRef.current += 1;
-    setConnectionAttempts(attemptsRef.current);
-
-    const delay = Math.min(
-      BASE_BACKOFF_MS * Math.pow(2, attemptsRef.current - 1),
-      MAX_BACKOFF_MS,
-    );
-
-    reconnectTimer.current = setTimeout(() => {
-      if (!unmountedRef.current) connect();
-    }, delay);
-  }, [connect]);
+  }, [scheduleReconnect]);
 
   useEffect(() => {
     unmountedRef.current = false;
