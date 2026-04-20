@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import EphemeralCountdown from "./EphemeralCountdown";
+import EngagementMilestones from "@/src/components/EngagementMilestones";
 import LiveViewerBadge from "./LiveViewerBadge";
 import MilestoneCelebration from "./MilestoneCelebration";
 import StreakFlame from "./StreakFlame";
@@ -173,6 +174,7 @@ export default function BroadcastDashboard() {
           </div>
         </div>
       </section>
+      <EngagementMilestones currentInteractions={views} dailyGoal={120} />
 
       <MilestoneCelebration
         milestone={activeMilestone}
