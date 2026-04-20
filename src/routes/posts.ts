@@ -86,7 +86,13 @@ router.post('/short', requireAuth, zeroReplyGuard, async (req: Request, res: Res
     }
 
     const { content, mediaUrls, hashtags } = parsed.data;
-    const userId = req.user!.sub;
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const userId = req.user.sub;
 
     // Biometric pre-flight: confirm liveness with Quantmail before publishing.
     const isLive = await quantmailLiveness.checkLiveness(userId);
@@ -101,12 +107,16 @@ router.post('/short', requireAuth, zeroReplyGuard, async (req: Request, res: Res
       update: {},
       create: {
         quantmailId: userId,
-        email:       req.user!.email,
-        displayName: req.user!.displayName ?? req.user!.email,
+        email:       req.user.email,
+        displayName: req.user.displayName ?? req.user.email,
       },
     });
 
-    const user = await prisma.user.findUniqueOrThrow({ where: { quantmailId: userId } });
+    const user = await prisma.user.findUnique({ where: { quantmailId: userId } });
+    if (!user) {
+      res.status(500).json({ error: 'Failed to create or retrieve user profile' });
+      return;
+    }
 
     const post = await prisma.shortPost.create({
       data: { authorId: user.id, content, mediaUrls, hashtags },
@@ -140,7 +150,13 @@ router.post('/deep', requireAuth, zeroReplyGuard, async (req: Request, res: Resp
     }
 
     const { title, summary, content, coverImageUrl, tags, readTimeMin, isPublished } = parsed.data;
-    const userId = req.user!.sub;
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const userId = req.user.sub;
 
     // Biometric pre-flight: confirm liveness with Quantmail before publishing.
     const isLive = await quantmailLiveness.checkLiveness(userId);
@@ -154,12 +170,16 @@ router.post('/deep', requireAuth, zeroReplyGuard, async (req: Request, res: Resp
       update: {},
       create: {
         quantmailId: userId,
-        email:       req.user!.email,
-        displayName: req.user!.displayName ?? req.user!.email,
+        email:       req.user.email,
+        displayName: req.user.displayName ?? req.user.email,
       },
     });
 
-    const user = await prisma.user.findUniqueOrThrow({ where: { quantmailId: userId } });
+    const user = await prisma.user.findUnique({ where: { quantmailId: userId } });
+    if (!user) {
+      res.status(500).json({ error: 'Failed to create or retrieve user profile' });
+      return;
+    }
 
     const post = await prisma.deepPost.create({
       data: {
@@ -278,7 +298,12 @@ router.get('/deep/:id', requireAuth, async (req: Request, res: Response, next: N
 // ---------------------------------------------------------------------------
 router.delete('/short/:id', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const userId = req.user!.sub;
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const userId = req.user.sub;
     const user   = await prisma.user.findUnique({ where: { quantmailId: userId } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
@@ -297,7 +322,12 @@ router.delete('/short/:id', requireAuth, async (req: Request, res: Response, nex
 // ---------------------------------------------------------------------------
 router.delete('/deep/:id', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const userId = req.user!.sub;
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const userId = req.user.sub;
     const user   = await prisma.user.findUnique({ where: { quantmailId: userId } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 

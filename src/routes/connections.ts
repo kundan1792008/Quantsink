@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import prisma from '../lib/prisma';
 import { requireAuth } from '../middleware/auth';
+import { Prisma } from '@prisma/client';
 
 const router = Router();
 
@@ -40,7 +41,13 @@ router.post('/connect', requireAuth, async (req: Request, res: Response, next: N
     }
 
     const { targetUserId, message } = parsed.data;
-    const fromUser = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const fromUser = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!fromUser) { res.status(404).json({ error: 'Your user profile not found' }); return; }
 
     if (fromUser.id === targetUserId) {
@@ -62,6 +69,17 @@ router.post('/connect', requireAuth, async (req: Request, res: Response, next: N
 
     res.status(201).json({ connection });
   } catch (err) {
+    // Handle Prisma unique constraint violations
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      if (err.code === 'P2002') {
+        res.status(409).json({ error: 'Connection request already exists' });
+        return;
+      }
+      if (err.code === 'P2025') {
+        res.status(404).json({ error: 'Target user not found' });
+        return;
+      }
+    }
     next(err);
   }
 });
@@ -77,7 +95,12 @@ router.patch('/:id', requireAuth, async (req: Request, res: Response, next: Next
       return;
     }
 
-    const user = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
     const conn = await prisma.connection.findFirst({
@@ -92,6 +115,13 @@ router.patch('/:id', requireAuth, async (req: Request, res: Response, next: Next
 
     res.json({ connection: updated });
   } catch (err) {
+    // Handle Prisma errors
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      if (err.code === 'P2025') {
+        res.status(404).json({ error: 'Connection not found or already processed' });
+        return;
+      }
+    }
     next(err);
   }
 });
@@ -132,7 +162,12 @@ router.post('/follow', requireAuth, async (req: Request, res: Response, next: Ne
       return;
     }
 
-    const user = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
     if (user.id === parsed.data.targetUserId) {
@@ -181,7 +216,12 @@ router.post('/skills', requireAuth, async (req: Request, res: Response, next: Ne
       return;
     }
 
-    const user = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!user) { res.status(404).json({ error: 'User not found' }); return; }
 
     const skill = await prisma.skill.upsert({
@@ -214,7 +254,13 @@ router.post('/endorse', requireAuth, async (req: Request, res: Response, next: N
     }
 
     const { endorsedUserId, skillName } = parsed.data;
-    const endorser = await prisma.user.findUnique({ where: { quantmailId: req.user!.sub } });
+
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+      return;
+    }
+
+    const endorser = await prisma.user.findUnique({ where: { quantmailId: req.user.sub } });
     if (!endorser) { res.status(404).json({ error: 'Your user profile not found' }); return; }
 
     if (endorser.id === endorsedUserId) {

@@ -133,7 +133,11 @@ export function createInfluenceRouter(
     requireAuth,
     async (req: Request, res: Response, next: NextFunction) => {
       try {
-        const userId = req.user!.sub;
+        if (!req.user) {
+          res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+          return;
+        }
+        const userId = req.user.sub;
         const breakdown = await service.getBreakdown(userId);
         const rank = await service.rankFor(userId);
         res.json({
@@ -167,7 +171,11 @@ export function createInfluenceRouter(
     requireAuth,
     async (req: Request, res: Response, next: NextFunction) => {
       try {
-        const userId = req.user!.sub;
+        if (!req.user) {
+          res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+          return;
+        }
+        const userId = req.user.sub;
         const score = await service.recalculate(userId);
         res.json({ score });
       } catch (err) {
@@ -286,7 +294,11 @@ export function createInfluenceRouter(
     requireAuth,
     async (req: Request, res: Response, next: NextFunction) => {
       try {
-        const userId = req.user!.sub;
+        if (!req.user) {
+          res.status(401).json({ error: 'Unauthorized: user not authenticated' });
+          return;
+        }
+        const userId = req.user.sub;
         const challenges = await service.listChallenges(userId);
         res.json({ challenges });
       } catch (err) {

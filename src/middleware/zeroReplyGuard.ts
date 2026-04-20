@@ -9,6 +9,12 @@ import logger from '../lib/logger';
 const BANNED_FIELDS = ['replyTo', 'quoteTo', 'reactTo', 'parentId'] as const;
 
 /**
+ * Counter for audit log failures to monitor system health
+ */
+let auditLogFailureCount = 0;
+const AUDIT_LOG_FAILURE_ALERT_THRESHOLD = 10;
+
+/**
  * Zero-Reply Protocol guard middleware.
  *
  * Intercepts ALL write requests (POST / PUT / PATCH) and rejects any that
@@ -56,7 +62,15 @@ export async function zeroReplyGuard(
       },
     })
     .catch((err: unknown) => {
-      logger.error({ err }, 'Failed to persist SecurityAuditLog entry');
+      auditLogFailureCount++;
+      logger.error({ err, failureCount: auditLogFailureCount }, 'Failed to persist SecurityAuditLog entry');
+
+      if (auditLogFailureCount % AUDIT_LOG_FAILURE_ALERT_THRESHOLD === 0) {
+        logger.fatal(
+          { failureCount: auditLogFailureCount },
+          'CRITICAL: Audit log failures exceeded threshold - security events may not be tracked',
+        );
+      }
     });
 
   res.status(403).json({ error: 'ZERO_REPLY_PROTOCOL_ACTIVE' });

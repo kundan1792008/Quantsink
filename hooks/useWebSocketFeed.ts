@@ -15,6 +15,11 @@ export interface WsNewPostEvent {
 type WsMessage = WsNewBroadcastEvent | WsNewPostEvent;
 
 /**
+ * Counter for JSON parse errors to monitor WebSocket data quality
+ */
+let parseErrorCount = 0;
+
+/**
  * useWebSocketFeed
  *
  * Opens a persistent WebSocket connection to the Quantsink broadcast server
@@ -66,8 +71,12 @@ export function useWebSocketFeed(
         } else if (data.type === "NEW_POST") {
           onNewPostRef.current(data.post);
         }
-      } catch {
-        // ignore malformed frames
+      } catch (error) {
+        parseErrorCount++;
+        if (parseErrorCount % 10 === 0) {
+          console.warn(`WebSocket parse errors: ${parseErrorCount} total malformed messages received`);
+        }
+        // Silently ignore individual malformed messages
       }
     };
 
